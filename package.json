@@ -11,6 +11,9 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint src"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "keywords": [
     "invomatch"
   ],
