@@ -59,17 +59,52 @@ const deliveryTool: Anthropic.Tool = {
 };
 
 /**
- * Sends a delivery photo + the list of items expected per the invoice to
- * Claude, and gets back a per-item match verdict. Flags photos that clearly
- * aren't of a physical delivery at all.
+ * Sends one or more delivery photos + the list of items expected per the
+ * invoice to Claude, and gets back a per-item match verdict. Flags the
+ * upload if none of the photos are usable shots of a physical delivery.
+ *
+ * When multiple photos are provided, they're treated as different angles
+ * or parts (e.g. multiple boxes) of the same delivery — Claude is told to
+ * combine counts across all of them without double-counting anything that
+ * appears in more than one photo.
  */
 export async function analyzeDeliveryPhoto(
-  file: { buffer: Buffer; mimetype: string },
+  files: { buffer: Buffer; mimetype: string }[],
   expectedItems: ExpectedDeliveryItem[]
 ): Promise<AnalyzedDeliveryResult> {
   const expectedItemsText = expectedItems
     .map((item) => `${item.index}. ${item.name} — expected qty: ${item.expectedQuantity}`)
     .join("\n");
+
+  const imageBlocks: Anthropic.ContentBlockParam[] = files.map((file) => ({
+    type: "image",
+    source: {
+      type: "base64",
+      media_type: file.mimetype as "image/jpeg" | "image/png" | "image/webp",
+      data: file.buffer.toString("base64"),
+    },
+  }));
+
+  const promptText =
+    files.length > 1
+      ? "A store employee just photographed a physical delivery, across multiple photos (e.g. different angles or " +
+        "several boxes), to check it against an invoice. First decide whether at least one of these photos is " +
+        "actually a usable shot of delivered goods (not a document, not something unrelated, not too dark/blurry to " +
+        "identify products). If so, look at all the photos together as one delivery and compare the combined total " +
+        "of what you see against this list of items expected from the invoice, being careful not to double-count " +
+        `the same physical units if they appear in more than one photo:\n\n${expectedItemsText}\n\n` +
+        "For every expected item (by its index), report the total number of units you can identify across all the " +
+        "photos and a match_status: 'matched' if the counted quantity matches (or closely matches) what's expected, " +
+        "'needs_review' if you found the item but the quantity looks off or you're unsure, or 'missing' if you " +
+        "can't find it in any photo. If the photos show items not on the list, ignore them."
+      : "A store employee just photographed a physical delivery to check it against an invoice. First decide " +
+        "whether this is actually a usable photo of delivered goods (not a document, not something unrelated, " +
+        "not too dark/blurry to identify products). If it is, compare what you see against this list of items " +
+        `expected from the invoice:\n\n${expectedItemsText}\n\n` +
+        "For every expected item (by its index), report how many units you can identify in the photo and a " +
+        "match_status: 'matched' if the counted quantity matches (or closely matches) what's expected, " +
+        "'needs_review' if you found the item but the quantity looks off or you're unsure, or 'missing' if you " +
+        "can't find it in the photo at all. If the photo shows items not on the list, ignore them.";
 
   const message = await anthropic.messages.create({
     model: CLAUDE_MODEL,
@@ -79,28 +114,7 @@ export async function analyzeDeliveryPhoto(
     messages: [
       {
         role: "user",
-        content: [
-          {
-            type: "image",
-            source: {
-              type: "base64",
-              media_type: file.mimetype as "image/jpeg" | "image/png" | "image/webp",
-              data: file.buffer.toString("base64"),
-            },
-          },
-          {
-            type: "text",
-            text:
-              "A store employee just photographed a physical delivery to check it against an invoice. First decide " +
-              "whether this is actually a usable photo of delivered goods (not a document, not something unrelated, " +
-              "not too dark/blurry to identify products). If it is, compare what you see against this list of items " +
-              `expected from the invoice:\n\n${expectedItemsText}\n\n` +
-              "For every expected item (by its index), report how many units you can identify in the photo and a " +
-              "match_status: 'matched' if the counted quantity matches (or closely matches) what's expected, " +
-              "'needs_review' if you found the item but the quantity looks off or you're unsure, or 'missing' if you " +
-              "can't find it in the photo at all. If the photo shows items not on the list, ignore them.",
-          },
-        ],
+        content: [...imageBlocks, { type: "text", text: promptText }],
       },
     ],
   });

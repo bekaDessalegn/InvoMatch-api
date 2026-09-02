@@ -7,8 +7,8 @@ import { signStoragePath } from "../services/storage";
 
 const createDeliverySchema = z.object({
   invoice_id: z.string().uuid(),
-  // Storage path returned by POST /deliveries/analyze — not a public URL.
-  photo_url: z.string().nullable().optional(),
+  // Storage paths returned by POST /deliveries/analyze — not public URLs.
+  photo_paths: z.array(z.string()).optional().default([]),
   status: z.enum(["pending", "verified", "discrepancy"]).optional().default("pending"),
 });
 
@@ -25,10 +25,15 @@ const upsertDeliveryLineItemSchema = z.object({
 const DELIVERY_SELECT =
   "*, invoices(invoice_number, vendor_id, vendors(name)), delivery_line_items(*, invoice_line_items(raw_name, quantity, unit_price))";
 
-/** Replaces each delivery's stored photo path with a short-lived signed URL. */
-async function signDeliveryPhotos<T extends { photo_url: string | null }>(deliveries: T[]): Promise<T[]> {
+/** Replaces each delivery's stored photo paths with short-lived signed URLs. */
+async function signDeliveryPhotos<T extends { photo_paths: string[] }>(
+  deliveries: T[]
+): Promise<(T & { photo_urls: (string | null)[] })[]> {
   return Promise.all(
-    deliveries.map(async (d) => ({ ...d, photo_url: await signStoragePath("delivery-photos", d.photo_url) }))
+    deliveries.map(async (d) => ({
+      ...d,
+      photo_urls: await Promise.all(d.photo_paths.map((path) => signStoragePath("delivery-photos", path))),
+    }))
   );
 }
 

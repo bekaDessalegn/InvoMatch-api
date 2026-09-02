@@ -66,7 +66,7 @@ export interface Invoice {
   subtotal: number;
   tax: number;
   total: number;
-  photo_url: string | null;
+  photo_paths: string[];
   created_at: string;
 }
 
@@ -95,7 +95,7 @@ export interface Delivery {
   id: string;
   store_id: string;
   invoice_id: string;
-  photo_url: string | null;
+  photo_paths: string[];
   status: DeliveryStatus;
   created_at: string;
 }

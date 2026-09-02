@@ -64,12 +64,18 @@ const invoiceTool: Anthropic.Tool = {
 };
 
 /**
- * Sends an invoice photo/PDF to Claude and returns structured line items, or
- * flags the upload as not being a valid invoice at all (blurry, wrong
- * subject, etc.) so the caller can ask the user to retake/reselect it.
+ * Sends one or more invoice photos (or a single PDF) to Claude in a single
+ * message and returns structured line items, or flags the upload as not
+ * being a valid invoice at all (blurry, wrong subject, etc.) so the caller
+ * can ask the user to retake/reselect it.
+ *
+ * When multiple files are provided, they're treated as consecutive pages of
+ * the same invoice — useful for long receipts that don't fit in one shot.
  */
-export async function parseInvoiceDocument(file: { buffer: Buffer; mimetype: string }): Promise<ParsedInvoiceResult> {
-  const documentBlock: Anthropic.ContentBlockParam =
+export async function parseInvoiceDocument(
+  files: { buffer: Buffer; mimetype: string }[]
+): Promise<ParsedInvoiceResult> {
+  const documentBlocks: Anthropic.ContentBlockParam[] = files.map((file) =>
     file.mimetype === "application/pdf"
       ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: file.buffer.toString("base64") } }
       : {
@@ -79,7 +85,25 @@ export async function parseInvoiceDocument(file: { buffer: Buffer; mimetype: str
             media_type: file.mimetype as "image/jpeg" | "image/png" | "image/webp",
             data: file.buffer.toString("base64"),
           },
-        };
+        }
+  );
+
+  const promptText =
+    files.length > 1
+      ? "These are multiple photos a store owner just captured, in order, of the same long supplier invoice/receipt " +
+        "(e.g. because it didn't fit in one shot) — treat them as consecutive pages/sections of one document, not " +
+        "separate invoices. Carefully determine whether they actually show an invoice/receipt/packing slip. If yes, " +
+        "extract every line item across all the photos (without duplicating any line item that appears in more than " +
+        "one photo due to overlap) with quantity and unit price, plus the vendor name, invoice number, date, " +
+        "subtotal, tax, and total. If any totals aren't printed, compute subtotal as the sum of line item totals and " +
+        "leave tax as 0 unless a tax amount is visible. If none of the photos show a valid invoice, set is_invoice to " +
+        "false and explain why in rejection_reason instead of guessing at data."
+      : "This is a photo or document a store owner just captured, hoping to log a supplier invoice. " +
+        "Carefully determine whether it actually is an invoice/receipt/packing slip. If yes, extract every " +
+        "line item with quantity and unit price, plus the vendor name, invoice number, date, subtotal, tax, " +
+        "and total. If any totals aren't printed, compute subtotal as the sum of line item totals and leave " +
+        "tax as 0 unless a tax amount is visible. If it's not a valid invoice, set is_invoice to false and " +
+        "explain why in rejection_reason instead of guessing at data.";
 
   const message = await anthropic.messages.create({
     model: CLAUDE_MODEL,
@@ -89,19 +113,7 @@ export async function parseInvoiceDocument(file: { buffer: Buffer; mimetype: str
     messages: [
       {
         role: "user",
-        content: [
-          documentBlock,
-          {
-            type: "text",
-            text:
-              "This is a photo or document a store owner just captured, hoping to log a supplier invoice. " +
-              "Carefully determine whether it actually is an invoice/receipt/packing slip. If yes, extract every " +
-              "line item with quantity and unit price, plus the vendor name, invoice number, date, subtotal, tax, " +
-              "and total. If any totals aren't printed, compute subtotal as the sum of line item totals and leave " +
-              "tax as 0 unless a tax amount is visible. If it's not a valid invoice, set is_invoice to false and " +
-              "explain why in rejection_reason instead of guessing at data.",
-          },
-        ],
+        content: [...documentBlocks, { type: "text", text: promptText }],
       },
     ],
   });

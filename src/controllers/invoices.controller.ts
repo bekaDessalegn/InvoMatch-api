@@ -21,8 +21,8 @@ const createInvoiceSchema = z.object({
   subtotal: z.number(),
   tax: z.number(),
   total: z.number(),
-  // Storage path returned by POST /invoices/parse — not a public URL.
-  photo_url: z.string().nullable().optional(),
+  // Storage paths returned by POST /invoices/parse — not public URLs.
+  photo_paths: z.array(z.string()).optional().default([]),
   line_items: z.array(lineItemSchema).optional().default([]),
 });
 
@@ -30,11 +30,47 @@ const updateInvoiceSchema = createInvoiceSchema
   .omit({ line_items: true })
   .partial();
 
-/** Replaces each invoice's stored photo path with a short-lived signed URL. */
-async function signInvoicePhotos<T extends { photo_url: string | null }>(invoices: T[]): Promise<T[]> {
+/** Replaces each invoice's stored photo paths with short-lived signed URLs. */
+async function signInvoicePhotos<T extends { photo_paths: string[] }>(
+  invoices: T[]
+): Promise<(T & { photo_urls: (string | null)[] })[]> {
   return Promise.all(
-    invoices.map(async (inv) => ({ ...inv, photo_url: await signStoragePath("invoice-photos", inv.photo_url) }))
+    invoices.map(async (inv) => ({
+      ...inv,
+      photo_urls: await Promise.all(inv.photo_paths.map((path) => signStoragePath("invoice-photos", path))),
+    }))
   );
+}
+
+/**
+ * Attaches each invoice's most recent delivery status, so the app can tell
+ * "confirmed, nothing delivered/verified yet" apart from "confirmed and the
+ * delivery was actually checked against it" — a confirmed invoice on its
+ * own isn't a success state, a verified delivery is.
+ */
+async function attachDeliveryStatus<T extends { id: string }>(
+  storeId: string,
+  invoices: T[]
+): Promise<(T & { delivery_status: string | null })[]> {
+  if (invoices.length === 0) return [];
+
+  const { data: deliveries, error } = await supabase
+    .from("deliveries")
+    .select("invoice_id, status, created_at")
+    .eq("store_id", storeId)
+    .in(
+      "invoice_id",
+      invoices.map((inv) => inv.id)
+    )
+    .order("created_at", { ascending: false });
+  if (error) throw new ApiError(500, error.message);
+
+  const statusByInvoice = new Map<string, string>();
+  for (const delivery of deliveries ?? []) {
+    if (!statusByInvoice.has(delivery.invoice_id)) statusByInvoice.set(delivery.invoice_id, delivery.status);
+  }
+
+  return invoices.map((inv) => ({ ...inv, delivery_status: statusByInvoice.get(inv.id) ?? null }));
 }
 
 export async function listInvoices(req: Request, res: Response) {
@@ -53,7 +89,8 @@ export async function listInvoices(req: Request, res: Response) {
 
   const { data, error } = await query;
   if (error) throw new ApiError(500, error.message);
-  res.json({ data: await signInvoicePhotos(data ?? []) });
+  const withPhotos = await signInvoicePhotos(data ?? []);
+  res.json({ data: await attachDeliveryStatus(req.storeId!, withPhotos) });
 }
 
 export async function getInvoice(req: Request, res: Response) {
@@ -67,7 +104,8 @@ export async function getInvoice(req: Request, res: Response) {
   if (error) throw new ApiError(500, error.message);
   if (!data) throw new ApiError(404, "Invoice not found");
   const [withSignedPhoto] = await signInvoicePhotos([data]);
-  res.json({ data: withSignedPhoto });
+  const [withDeliveryStatus] = await attachDeliveryStatus(req.storeId!, [withSignedPhoto]);
+  res.json({ data: withDeliveryStatus });
 }
 
 export async function createInvoice(req: Request, res: Response) {
@@ -223,5 +261,6 @@ export async function confirmInvoice(req: Request, res: Response) {
   if (updateError) throw new ApiError(500, updateError.message);
 
   const [withSignedPhoto] = await signInvoicePhotos([confirmed]);
-  res.json({ data: withSignedPhoto });
+  const [withDeliveryStatus] = await attachDeliveryStatus(storeId, [withSignedPhoto]);
+  res.json({ data: withDeliveryStatus });
 }

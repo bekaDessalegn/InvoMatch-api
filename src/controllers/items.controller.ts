@@ -14,6 +14,7 @@ const updateItemSchema = createItemSchema.partial();
 interface PriceHistoryRow {
   item_id: string;
   vendor_id: string;
+  invoice_id: string;
   price: number;
   recorded_at: string;
   vendors: { name: string } | null;
@@ -37,7 +38,7 @@ async function attachItemAggregates(storeId: string, items: Record<string, unkno
   const [{ data: history, error: historyError }, { data: vendorItems, error: viError }] = await Promise.all([
     supabase
       .from("price_history")
-      .select("item_id, vendor_id, price, recorded_at, vendors(name)")
+      .select("item_id, vendor_id, invoice_id, price, recorded_at, vendors(name)")
       .eq("store_id", storeId)
       .order("recorded_at", { ascending: false }),
     supabase.from("vendor_items").select("item_id, vendor_id, vendor_sku").eq("store_id", storeId),
@@ -46,8 +47,18 @@ async function attachItemAggregates(storeId: string, items: Record<string, unkno
   if (historyError) throw new ApiError(500, historyError.message);
   if (viError) throw new ApiError(500, viError.message);
 
+  // See the equivalent comment in priceAlerts.controller.ts — collapse
+  // multiple lines of the same invoice down to one row per invoice so
+  // current/previous cost reflect two different invoices, not two lines of
+  // the same one.
   const historyByItem = new Map<string, PriceHistoryRow[]>();
+  const seenInvoicesByItem = new Map<string, Set<string>>();
   for (const row of (history ?? []) as unknown as PriceHistoryRow[]) {
+    const seenInvoices = seenInvoicesByItem.get(row.item_id) ?? new Set<string>();
+    if (seenInvoices.has(row.invoice_id)) continue;
+    seenInvoices.add(row.invoice_id);
+    seenInvoicesByItem.set(row.item_id, seenInvoices);
+
     const list = historyByItem.get(row.item_id) ?? [];
     list.push(row);
     historyByItem.set(row.item_id, list);
@@ -106,7 +117,17 @@ export async function getItemPriceHistory(req: Request, res: Response) {
     .order("recorded_at", { ascending: true });
 
   if (error) throw new ApiError(500, error.message);
-  res.json({ data });
+
+  // Same collapse as attachItemAggregates: one chart point per invoice,
+  // not one per matching line item within an invoice.
+  const seenInvoices = new Set<string>();
+  const deduped = (data ?? []).filter((row) => {
+    if (seenInvoices.has(row.invoice_id as string)) return false;
+    seenInvoices.add(row.invoice_id as string);
+    return true;
+  });
+
+  res.json({ data: deduped });
 }
 
 export async function createItem(req: Request, res: Response) {

@@ -11,7 +11,7 @@ import {
 } from "../controllers/invoices.controller";
 import { asyncHandler } from "../middleware/asyncHandler";
 import { authenticate, requireStore } from "../middleware/auth";
-import { upload } from "../middleware/upload";
+import { uploadMultiple } from "../middleware/upload";
 
 export const invoicesRouter = Router();
 
@@ -24,5 +24,6 @@ invoicesRouter.patch("/:id", asyncHandler(updateInvoice));
 invoicesRouter.delete("/:id", asyncHandler(deleteInvoice));
 invoicesRouter.post("/:id/confirm", asyncHandler(confirmInvoice));
 
-// AI-powered: accepts an invoice photo/PDF and returns structured line items.
-invoicesRouter.post("/parse", upload.single("file"), asyncHandler(parseInvoice));
+// AI-powered: accepts one or more invoice photos (or a single PDF) and
+// returns structured line items.
+invoicesRouter.post("/parse", uploadMultiple, asyncHandler(parseInvoice));

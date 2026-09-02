@@ -11,7 +11,7 @@ import {
 } from "../controllers/deliveries.controller";
 import { asyncHandler } from "../middleware/asyncHandler";
 import { authenticate, requireStore } from "../middleware/auth";
-import { upload } from "../middleware/upload";
+import { uploadMultiple } from "../middleware/upload";
 
 export const deliveriesRouter = Router();
 
@@ -24,5 +24,5 @@ deliveriesRouter.patch("/:id", asyncHandler(updateDelivery));
 deliveriesRouter.delete("/:id", asyncHandler(deleteDelivery));
 deliveriesRouter.put("/:id/line-items", asyncHandler(upsertDeliveryLineItems));
 
-// AI-powered: accepts a delivery photo and returns detected item counts/matches.
-deliveriesRouter.post("/analyze", upload.single("file"), asyncHandler(analyzeDelivery));
+// AI-powered: accepts one or more delivery photos and returns detected item counts/matches.
+deliveriesRouter.post("/analyze", uploadMultiple, asyncHandler(analyzeDelivery));
