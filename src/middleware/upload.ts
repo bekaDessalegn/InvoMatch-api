@@ -19,8 +19,9 @@ export const upload = multer({
 });
 
 /**
- * Same constraints as `upload`, but accepts up to 10 files under the field
+ * Same constraints as `upload`, but accepts up to 25 files under the field
  * name "files" — used by `/invoices/parse` and `/deliveries/analyze` so a
- * long invoice or a big delivery can be captured across several photos.
+ * long invoice or a big delivery (aisle stacks, multiple pallets) can be
+ * captured across many photos.
  */
-export const uploadMultiple = upload.array("files", 10);
+export const uploadMultiple = upload.array("files", 25);

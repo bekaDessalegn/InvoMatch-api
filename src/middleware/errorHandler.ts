@@ -21,6 +21,12 @@ export function errorHandler(
 
   const message = err instanceof Error ? err.message : "Internal server error";
   console.error("Unhandled error:", err);
+  if (typeof err === "object" && err !== null && "status" in err && (err as { status: unknown }).status === 413) {
+    res.status(413).json({
+      error: "Those photos are too large to analyze together. Try fewer photos, or retake closer shots of each stack.",
+    });
+    return;
+  }
   res.status(500).json({ error: message });
 }
 

@@ -191,64 +191,118 @@ export async function confirmInvoice(req: Request, res: Response) {
   const lineItems: { id: string; raw_name: string; unit_price: number; vendor_item_id: string | null }[] =
     invoice.invoice_line_items ?? [];
 
-  for (const line of lineItems) {
-    let itemId: string;
-    const { data: existingItem, error: findItemError } = await supabase
+  // Confirm used to do 4–6 Supabase round-trips *per line*. A 100-item
+  // wholesale invoice became hundreds of sequential HTTP calls. Batch
+  // instead: load existing catalog rows once, insert what's missing, then
+  // link lines and write price history in bulk.
+  if (lineItems.length > 0) {
+    const { data: existingItems, error: itemsError } = await supabase
       .from("items")
-      .select("id")
-      .eq("store_id", storeId)
-      .ilike("canonical_name", line.raw_name)
-      .maybeSingle();
-    if (findItemError) throw new ApiError(500, findItemError.message);
+      .select("id, canonical_name")
+      .eq("store_id", storeId);
+    if (itemsError) throw new ApiError(500, itemsError.message);
 
-    if (existingItem) {
-      itemId = existingItem.id;
-    } else {
-      const { data: newItem, error: createItemError } = await supabase
+    const itemByName = new Map<string, string>();
+    for (const item of existingItems ?? []) {
+      itemByName.set(item.canonical_name.trim().toLowerCase(), item.id);
+    }
+
+    const missingItemNames: string[] = [];
+    const queuedItemNames = new Set<string>();
+    for (const line of lineItems) {
+      const key = line.raw_name.trim().toLowerCase();
+      if (!itemByName.has(key) && !queuedItemNames.has(key)) {
+        queuedItemNames.add(key);
+        missingItemNames.push(line.raw_name.trim() || line.raw_name);
+      }
+    }
+
+    if (missingItemNames.length > 0) {
+      const { data: createdItems, error: createItemsError } = await supabase
         .from("items")
-        .insert({ store_id: storeId, canonical_name: line.raw_name })
-        .select("id")
-        .single();
-      if (createItemError) throw new ApiError(500, createItemError.message);
-      itemId = newItem.id;
+        .insert(missingItemNames.map((canonical_name) => ({ store_id: storeId, canonical_name })))
+        .select("id, canonical_name");
+      if (createItemsError) throw new ApiError(500, createItemsError.message);
+      for (const item of createdItems ?? []) {
+        itemByName.set(item.canonical_name.trim().toLowerCase(), item.id);
+      }
     }
 
-    let vendorItemId: string;
-    const { data: existingVendorItem, error: findViError } = await supabase
+    const { data: existingVendorItems, error: visError } = await supabase
       .from("vendor_items")
-      .select("id")
+      .select("id, item_id")
       .eq("store_id", storeId)
-      .eq("vendor_id", invoice.vendor_id)
-      .eq("item_id", itemId)
-      .maybeSingle();
-    if (findViError) throw new ApiError(500, findViError.message);
+      .eq("vendor_id", invoice.vendor_id);
+    if (visError) throw new ApiError(500, visError.message);
 
-    if (existingVendorItem) {
-      vendorItemId = existingVendorItem.id;
-    } else {
-      const { data: newVendorItem, error: createViError } = await supabase
-        .from("vendor_items")
-        .insert({ store_id: storeId, vendor_id: invoice.vendor_id, item_id: itemId, vendor_description: line.raw_name })
-        .select("id")
-        .single();
-      if (createViError) throw new ApiError(500, createViError.message);
-      vendorItemId = newVendorItem.id;
+    const vendorItemByItemId = new Map<string, string>();
+    for (const vi of existingVendorItems ?? []) {
+      vendorItemByItemId.set(vi.item_id, vi.id);
     }
 
-    const { error: linkError } = await supabase
-      .from("invoice_line_items")
-      .update({ vendor_item_id: vendorItemId })
-      .eq("id", line.id);
+    const missingVendorItems: { store_id: string; vendor_id: string; item_id: string; vendor_description: string }[] = [];
+    const queuedVendorItems = new Set<string>();
+    for (const line of lineItems) {
+      const itemId = itemByName.get(line.raw_name.trim().toLowerCase());
+      if (!itemId) throw new ApiError(500, `Couldn't match catalog item for "${line.raw_name}".`);
+      if (!vendorItemByItemId.has(itemId) && !queuedVendorItems.has(itemId)) {
+        queuedVendorItems.add(itemId);
+        missingVendorItems.push({
+          store_id: storeId,
+          vendor_id: invoice.vendor_id,
+          item_id: itemId,
+          vendor_description: line.raw_name,
+        });
+      }
+    }
+
+    if (missingVendorItems.length > 0) {
+      const { data: createdVis, error: createViError } = await supabase
+        .from("vendor_items")
+        .insert(missingVendorItems)
+        .select("id, item_id");
+      if (createViError) throw new ApiError(500, createViError.message);
+      for (const vi of createdVis ?? []) {
+        vendorItemByItemId.set(vi.item_id, vi.id);
+      }
+    }
+
+    const lineIdsByVendorItem = new Map<string, string[]>();
+    const priceRows: {
+      store_id: string;
+      item_id: string;
+      vendor_id: string;
+      invoice_id: string;
+      price: number;
+      recorded_at: string;
+    }[] = [];
+
+    for (const line of lineItems) {
+      const itemId = itemByName.get(line.raw_name.trim().toLowerCase())!;
+      const vendorItemId = vendorItemByItemId.get(itemId);
+      if (!vendorItemId) throw new ApiError(500, `Couldn't link "${line.raw_name}" to this vendor.`);
+      const ids = lineIdsByVendorItem.get(vendorItemId) ?? [];
+      ids.push(line.id);
+      lineIdsByVendorItem.set(vendorItemId, ids);
+      priceRows.push({
+        store_id: storeId,
+        item_id: itemId,
+        vendor_id: invoice.vendor_id,
+        invoice_id: invoice.id,
+        price: line.unit_price,
+        recorded_at: invoice.invoice_date,
+      });
+    }
+
+    const linkResults = await Promise.all(
+      [...lineIdsByVendorItem.entries()].map(([vendorItemId, ids]) =>
+        supabase.from("invoice_line_items").update({ vendor_item_id: vendorItemId }).in("id", ids)
+      )
+    );
+    const linkError = linkResults.find((r) => r.error)?.error;
     if (linkError) throw new ApiError(500, linkError.message);
 
-    const { error: priceError } = await supabase.from("price_history").insert({
-      store_id: storeId,
-      item_id: itemId,
-      vendor_id: invoice.vendor_id,
-      invoice_id: invoice.id,
-      price: line.unit_price,
-      recorded_at: invoice.invoice_date,
-    });
+    const { error: priceError } = await supabase.from("price_history").insert(priceRows);
     if (priceError) throw new ApiError(500, priceError.message);
   }
 

@@ -35,6 +35,12 @@ export async function parseInvoice(req: Request, res: Response) {
   if (!result.isInvoice) {
     throw new ApiError(422, result.rejectionReason ?? "This doesn't look like a valid invoice. Please retake it.");
   }
+  if (result.lineItems.length === 0) {
+    throw new ApiError(
+      422,
+      "We recognized this as an invoice but couldn't read any line items. Try a clearer PDF, or photograph each page."
+    );
+  }
 
   const photoPaths = await Promise.all(
     files.map((f) => uploadToStorage("invoice-photos", storeId, { buffer: f.buffer, mimetype: f.mimetype }))

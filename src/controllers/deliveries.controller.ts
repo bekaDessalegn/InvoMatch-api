@@ -47,6 +47,9 @@ export async function listDeliveries(req: Request, res: Response) {
   if (req.query.status) {
     query = query.eq("status", req.query.status as string);
   }
+  if (req.query.invoice_id) {
+    query = query.eq("invoice_id", req.query.invoice_id as string);
+  }
 
   const { data, error } = await query;
   if (error) throw new ApiError(500, error.message);
