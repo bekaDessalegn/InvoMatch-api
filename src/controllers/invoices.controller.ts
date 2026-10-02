@@ -4,6 +4,8 @@ import { z } from "zod";
 import { supabase } from "../db/supabase";
 import { ApiError } from "../middleware/errorHandler";
 import { signStoragePath } from "../services/storage";
+import { sortByCreatedAt } from "../utils/order";
+import { rollupDeliveryStatus } from "../utils/deliveryStatus";
 
 const lineItemSchema = z.object({
   vendor_item_id: z.string().uuid().nullable().optional(),
@@ -56,7 +58,7 @@ async function attachDeliveryStatus<T extends { id: string }>(
 
   const { data: deliveries, error } = await supabase
     .from("deliveries")
-    .select("invoice_id, status, created_at")
+    .select("id, invoice_id, status, created_at, delivery_line_items(confirmed_quantity, invoice_line_items(quantity))")
     .eq("store_id", storeId)
     .in(
       "invoice_id",
@@ -65,10 +67,24 @@ async function attachDeliveryStatus<T extends { id: string }>(
     .order("created_at", { ascending: false });
   if (error) throw new ApiError(500, error.message);
 
-  const statusByInvoice = new Map<string, string>();
+  const latestByInvoice = new Map<string, NonNullable<typeof deliveries>[number]>();
   for (const delivery of deliveries ?? []) {
-    if (!statusByInvoice.has(delivery.invoice_id)) statusByInvoice.set(delivery.invoice_id, delivery.status);
+    if (!latestByInvoice.has(delivery.invoice_id)) latestByInvoice.set(delivery.invoice_id, delivery);
   }
+
+  const statusByInvoice = new Map<string, string>();
+  const stale: { id: string; status: string }[] = [];
+  for (const [invoiceId, delivery] of latestByInvoice) {
+    const status = rollupDeliveryStatus(delivery.delivery_line_items, delivery.status);
+    statusByInvoice.set(invoiceId, status);
+    if (status !== delivery.status) stale.push({ id: delivery.id, status });
+  }
+
+  await Promise.all(
+    stale.map((row) =>
+      supabase.from("deliveries").update({ status: row.status }).eq("id", row.id).eq("store_id", storeId)
+    )
+  );
 
   return invoices.map((inv) => ({ ...inv, delivery_status: statusByInvoice.get(inv.id) ?? null }));
 }
@@ -103,7 +119,11 @@ export async function getInvoice(req: Request, res: Response) {
 
   if (error) throw new ApiError(500, error.message);
   if (!data) throw new ApiError(404, "Invoice not found");
-  const [withSignedPhoto] = await signInvoicePhotos([data]);
+  const ordered = {
+    ...data,
+    invoice_line_items: sortByCreatedAt(data.invoice_line_items),
+  };
+  const [withSignedPhoto] = await signInvoicePhotos([ordered]);
   const [withDeliveryStatus] = await attachDeliveryStatus(req.storeId!, [withSignedPhoto]);
   res.json({ data: withDeliveryStatus });
 }
@@ -124,11 +144,14 @@ export async function createInvoice(req: Request, res: Response) {
   if (invoiceError) throw new ApiError(500, invoiceError.message);
 
   if (line_items.length > 0) {
-    const rows = line_items.map((li) => ({
+    const stamp = Date.now();
+    const rows = line_items.map((li, index) => ({
       ...li,
       invoice_id: invoice.id,
       store_id: storeId,
       total_price: li.quantity * li.unit_price,
+      // 1ms apart so a later read can restore top-to-bottom invoice order.
+      created_at: new Date(stamp + index).toISOString(),
     }));
 
     const { error: lineItemsError } = await supabase.from("invoice_line_items").insert(rows);
@@ -314,7 +337,9 @@ export async function confirmInvoice(req: Request, res: Response) {
     .single();
   if (updateError) throw new ApiError(500, updateError.message);
 
-  const [withSignedPhoto] = await signInvoicePhotos([confirmed]);
+  const [withSignedPhoto] = await signInvoicePhotos([
+    { ...confirmed, invoice_line_items: sortByCreatedAt(confirmed.invoice_line_items) },
+  ]);
   const [withDeliveryStatus] = await attachDeliveryStatus(storeId, [withSignedPhoto]);
   res.json({ data: withDeliveryStatus });
 }

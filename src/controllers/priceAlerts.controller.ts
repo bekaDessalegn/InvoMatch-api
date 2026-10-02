@@ -85,7 +85,7 @@ export async function listPriceAlerts(req: Request, res: Response) {
   const alerts = [];
   for (const [key, rows] of byPair) {
     if (rows.length < 2) continue;
-    const [latest, previous] = rows as [PriceHistoryRow, PriceHistoryRow];
+    const [latest, previous, earlier] = rows as [PriceHistoryRow, PriceHistoryRow, PriceHistoryRow?];
     if (Number(latest.price) === Number(previous.price)) continue;
 
     const [itemId, vendorId] = key.split(":");
@@ -97,6 +97,7 @@ export async function listPriceAlerts(req: Request, res: Response) {
       sku: skuByItemVendor.get(key) ?? null,
       vendor_id: vendorId,
       vendor_name: latest.vendors?.name ?? "Unknown vendor",
+      earlier_price: earlier ? Number(earlier.price) : null,
       previous_price: Number(previous.price),
       new_price: Number(latest.price),
       source_invoice_id: latest.invoice_id,

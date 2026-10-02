@@ -5,6 +5,7 @@ import { analyzeDeliveryPhoto } from "../services/deliveryAnalysis";
 import { parseInvoiceDocument } from "../services/invoiceParsing";
 import { signStoragePath, uploadToStorage } from "../services/storage";
 import { ApiError } from "../middleware/errorHandler";
+import { sortByCreatedAt } from "../utils/order";
 
 /**
  * POST /invoices/parse
@@ -99,7 +100,7 @@ export async function analyzeDelivery(req: Request, res: Response) {
   const storeId = req.storeId!;
   const { data: invoice, error: invoiceError } = await supabase
     .from("invoices")
-    .select("id, invoice_line_items(id, raw_name, quantity)")
+    .select("id, invoice_line_items(id, raw_name, quantity, created_at)")
     .eq("id", invoiceId)
     .eq("store_id", storeId)
     .maybeSingle();
@@ -107,7 +108,9 @@ export async function analyzeDelivery(req: Request, res: Response) {
   if (invoiceError) throw new ApiError(500, invoiceError.message);
   if (!invoice) throw new ApiError(404, "Invoice not found");
 
-  const lineItems: { id: string; raw_name: string; quantity: number }[] = invoice.invoice_line_items ?? [];
+  const lineItems = sortByCreatedAt(
+    (invoice.invoice_line_items ?? []) as { id: string; raw_name: string; quantity: number; created_at?: string | null }[]
+  );
   if (lineItems.length === 0) {
     throw new ApiError(400, "This invoice has no line items to match a delivery against.");
   }

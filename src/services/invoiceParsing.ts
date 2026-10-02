@@ -47,7 +47,7 @@ const invoiceTool: Anthropic.Tool = {
       line_items: {
         type: "array",
         description:
-          "Every billed product line from every page. Skip barcodes, pallet IDs, headers, and $0.00 / out-of-stock rows.",
+          "Every billed product line from every page, in the exact top-to-bottom order printed on the invoice. Do not alphabetize or regroup. Skip barcodes, pallet IDs, headers, and $0.00 / out-of-stock rows.",
         items: {
           type: "object",
           properties: {
@@ -95,7 +95,8 @@ function extractionPrompt(fileCount: number, isPdf: boolean): string {
     pages +
     "Carefully determine whether it actually is an invoice/receipt/packing slip. If yes, extract: " +
     "vendor name, invoice number, date, every billed product line with quantity and unit price, plus subtotal, tax, and total. " +
-    "Rules for line items: include every product row with a quantity greater than 0; skip barcodes, UPC numbers, pallet IDs, " +
+    "Rules for line items: include every product row with a quantity greater than 0, in the same top-to-bottom order it is printed, " +
+    "page 1 first; do not sort alphabetically, by price, or by quantity. Skip barcodes, UPC numbers, pallet IDs, " +
     "headers, signatures, and out-of-stock / $0.00 total rows. If the invoice has Price, Discount, and Net columns, unit_price " +
     "must be the Net (what the store pays), not the pre-discount Price and not the line Total. " +
     "Do not stop after the first page. If any totals aren't printed, compute subtotal as the sum of line totals and leave tax as 0 " +
@@ -195,7 +196,8 @@ export async function parseInvoiceDocument(
       role: "user",
       content:
         "The previous extraction was incomplete or cut off. Call record_invoice again with the FULL invoice: " +
-        "vendor, invoice number, date, and every billed product line from every page. Do not omit items.",
+        "vendor, invoice number, date, and every billed product line from every page, in the same top-to-bottom order " +
+        "they are printed. Do not omit or reorder items.",
     });
   }
 

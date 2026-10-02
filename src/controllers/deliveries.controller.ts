@@ -4,6 +4,8 @@ import { z } from "zod";
 import { supabase } from "../db/supabase";
 import { ApiError } from "../middleware/errorHandler";
 import { signStoragePath } from "../services/storage";
+import { sortDeliveryLineItems } from "../utils/order";
+import { type DeliveryLineForStatus, matchStatusForQuantity, rollupDeliveryStatus } from "../utils/deliveryStatus";
 
 const createDeliverySchema = z.object({
   invoice_id: z.string().uuid(),
@@ -23,7 +25,7 @@ const upsertDeliveryLineItemSchema = z.object({
 });
 
 const DELIVERY_SELECT =
-  "*, invoices(invoice_number, vendor_id, vendors(name)), delivery_line_items(*, invoice_line_items(raw_name, quantity, unit_price))";
+  "*, invoices(invoice_number, vendor_id, vendors(name)), delivery_line_items(*, invoice_line_items(raw_name, quantity, unit_price, created_at))";
 
 /** Replaces each delivery's stored photo paths with short-lived signed URLs. */
 async function signDeliveryPhotos<T extends { photo_paths: string[] }>(
@@ -35,6 +37,25 @@ async function signDeliveryPhotos<T extends { photo_paths: string[] }>(
       photo_urls: await Promise.all(d.photo_paths.map((path) => signStoragePath("delivery-photos", path))),
     }))
   );
+}
+
+/** Status from corrected quantities, and write it back when the stored value is stale. */
+async function withRolledUpStatus<
+  T extends { id: string; status: string; delivery_line_items?: DeliveryLineForStatus[] | null },
+>(storeId: string, deliveries: T[]): Promise<T[]> {
+  const stale: { id: string; status: string }[] = [];
+  const next = deliveries.map((delivery) => {
+    const status = rollupDeliveryStatus(delivery.delivery_line_items, delivery.status);
+    if (status !== delivery.status) stale.push({ id: delivery.id, status });
+    return { ...delivery, status };
+  });
+
+  await Promise.all(
+    stale.map((row) =>
+      supabase.from("deliveries").update({ status: row.status }).eq("id", row.id).eq("store_id", storeId)
+    )
+  );
+  return next;
 }
 
 export async function listDeliveries(req: Request, res: Response) {
@@ -53,7 +74,13 @@ export async function listDeliveries(req: Request, res: Response) {
 
   const { data, error } = await query;
   if (error) throw new ApiError(500, error.message);
-  res.json({ data: await signDeliveryPhotos(data ?? []) });
+  const signed = await withRolledUpStatus(req.storeId!, await signDeliveryPhotos(data ?? []));
+  res.json({
+    data: signed.map((delivery) => ({
+      ...delivery,
+      delivery_line_items: sortDeliveryLineItems(delivery.delivery_line_items),
+    })),
+  });
 }
 
 export async function getDelivery(req: Request, res: Response) {
@@ -66,8 +93,13 @@ export async function getDelivery(req: Request, res: Response) {
 
   if (error) throw new ApiError(500, error.message);
   if (!data) throw new ApiError(404, "Delivery not found");
-  const [withSignedPhoto] = await signDeliveryPhotos([data]);
-  res.json({ data: withSignedPhoto });
+  const [withSignedPhoto] = await withRolledUpStatus(req.storeId!, await signDeliveryPhotos([data]));
+  res.json({
+    data: {
+      ...withSignedPhoto,
+      delivery_line_items: sortDeliveryLineItems(withSignedPhoto?.delivery_line_items),
+    },
+  });
 }
 
 export async function createDelivery(req: Request, res: Response) {
@@ -129,20 +161,32 @@ export async function upsertDeliveryLineItems(req: Request, res: Response) {
   if (deliveryError) throw new ApiError(500, deliveryError.message);
   if (!delivery) throw new ApiError(404, "Delivery not found");
 
-  const rows = parsed.data.map((li) => ({ ...li, delivery_id: req.params.id, store_id: req.storeId! }));
+  const lineIds = parsed.data.map((li) => li.invoice_line_item_id);
+  const { data: invoiceLines, error: linesError } = await supabase
+    .from("invoice_line_items")
+    .select("id, quantity")
+    .in("id", lineIds);
+  if (linesError) throw new ApiError(500, linesError.message);
+  const expectedById = new Map((invoiceLines ?? []).map((li) => [li.id as string, Number(li.quantity)]));
+
+  const rows = parsed.data.map((li) => {
+    const expected = expectedById.get(li.invoice_line_item_id);
+    const confirmed = li.confirmed_quantity;
+    const matchStatus =
+      expected == null ? li.match_status : matchStatusForQuantity(expected, confirmed ?? null);
+    return { ...li, match_status: matchStatus, delivery_id: req.params.id, store_id: req.storeId! };
+  });
 
   const { data, error } = await supabase.from("delivery_line_items").upsert(rows).select("*");
   if (error) throw new ApiError(500, error.message);
 
-  // Roll the individual line-item verdicts up into the delivery's overall
-  // status: any missing item is a discrepancy worth flagging; anything else
-  // that isn't a clean match still needs a human look before "verified".
-  const statuses = data?.map((row) => row.match_status) ?? [];
-  const overallStatus = statuses.includes("missing")
-    ? "discrepancy"
-    : statuses.every((s) => s === "matched")
-      ? "verified"
-      : "pending";
+  const overallStatus = rollupDeliveryStatus(
+    rows.map((row) => ({
+      confirmed_quantity: row.confirmed_quantity,
+      invoice_line_items: { quantity: expectedById.get(row.invoice_line_item_id) ?? null },
+    })),
+    "pending"
+  );
 
   const { error: statusError } = await supabase
     .from("deliveries")

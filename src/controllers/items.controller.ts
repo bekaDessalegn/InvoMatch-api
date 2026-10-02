@@ -111,7 +111,7 @@ export async function getItem(req: Request, res: Response) {
 export async function getItemPriceHistory(req: Request, res: Response) {
   const { data, error } = await supabase
     .from("price_history")
-    .select("*")
+    .select("price, recorded_at, invoice_id, invoices(invoice_number)")
     .eq("item_id", req.params.id)
     .eq("store_id", req.storeId!)
     .order("recorded_at", { ascending: true });
