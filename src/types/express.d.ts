@@ -8,6 +8,6 @@ declare namespace Express {
     userId?: string;
     userEmail?: string;
     storeId?: string;
-    storeRole?: "owner" | "keeper";
+    storeRole?: "owner" | "admin" | "worker";
   }
 }

@@ -4,7 +4,7 @@
  */
 
 export type SubscriptionStatus = "trial" | "active" | "past_due" | "canceled";
-export type StoreRole = "owner" | "keeper";
+export type StoreRole = "owner" | "admin" | "worker";
 
 export type VendorStatus = "active" | "inactive";
 export type InvoiceSourceType = "photo" | "pdf";

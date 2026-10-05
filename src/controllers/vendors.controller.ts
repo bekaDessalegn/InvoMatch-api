@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { supabase } from "../db/supabase";
 import { ApiError } from "../middleware/errorHandler";
+import { assertCanEdit, creatorScope, visibleVendorIds } from "../utils/access";
 
 const createVendorSchema = z.object({
   name: z.string().min(1),
@@ -19,13 +20,20 @@ const updateVendorSchema = createVendorSchema.partial();
  * businesses have a modest number of invoices, so a single query + in-memory
  * grouping is simpler and fast enough — no need for a DB view/RPC.
  */
-async function attachVendorAggregates(storeId: string, vendors: Record<string, unknown>[]) {
+async function attachVendorAggregates(
+  storeId: string,
+  vendors: Record<string, unknown>[],
+  createdBy?: string
+) {
   if (vendors.length === 0) return vendors;
 
-  const { data: invoices, error } = await supabase
+  let invoiceQuery = supabase
     .from("invoices")
     .select("vendor_id, total, invoice_date, status")
     .eq("store_id", storeId);
+  if (createdBy) invoiceQuery = invoiceQuery.eq("created_by", createdBy);
+
+  const { data: invoices, error } = await invoiceQuery;
 
   if (error) throw new ApiError(500, error.message);
 
@@ -50,14 +58,20 @@ async function attachVendorAggregates(storeId: string, vendors: Record<string, u
 }
 
 export async function listVendors(req: Request, res: Response) {
-  const { data, error } = await supabase
-    .from("vendors")
-    .select("*")
-    .eq("store_id", req.storeId!)
-    .order("created_at", { ascending: false });
+  const ownerId = creatorScope(req);
+  let query = supabase.from("vendors").select("*").eq("store_id", req.storeId!).order("created_at", { ascending: false });
+  if (ownerId) {
+    const ids = await visibleVendorIds(req.storeId!, ownerId);
+    if (ids.length === 0) {
+      res.json({ data: [] });
+      return;
+    }
+    query = query.in("id", ids);
+  }
 
+  const { data, error } = await query;
   if (error) throw new ApiError(500, error.message);
-  res.json({ data: await attachVendorAggregates(req.storeId!, data ?? []) });
+  res.json({ data: await attachVendorAggregates(req.storeId!, data ?? [], ownerId) });
 }
 
 export async function getVendor(req: Request, res: Response) {
@@ -70,7 +84,11 @@ export async function getVendor(req: Request, res: Response) {
 
   if (error) throw new ApiError(500, error.message);
   if (!data) throw new ApiError(404, "Vendor not found");
-  const [withAggregates] = await attachVendorAggregates(req.storeId!, [data]);
+  const ownerId = creatorScope(req);
+  if (ownerId && !(await visibleVendorIds(req.storeId!, ownerId)).includes(data.id)) {
+    throw new ApiError(404, "Vendor not found");
+  }
+  const [withAggregates] = await attachVendorAggregates(req.storeId!, [data], ownerId);
   res.json({ data: withAggregates });
 }
 
@@ -80,7 +98,7 @@ export async function createVendor(req: Request, res: Response) {
 
   const { data, error } = await supabase
     .from("vendors")
-    .insert({ ...parsed.data, store_id: req.storeId! })
+    .insert({ ...parsed.data, store_id: req.storeId!, created_by: req.userId! })
     .select("*")
     .single();
 
@@ -91,6 +109,16 @@ export async function createVendor(req: Request, res: Response) {
 export async function updateVendor(req: Request, res: Response) {
   const parsed = updateVendorSchema.safeParse(req.body);
   if (!parsed.success) throw new ApiError(400, "Invalid vendor payload", parsed.error.flatten());
+
+  const { data: existing, error: existingError } = await supabase
+    .from("vendors")
+    .select("created_by")
+    .eq("id", req.params.id)
+    .eq("store_id", req.storeId!)
+    .maybeSingle();
+  if (existingError) throw new ApiError(500, existingError.message);
+  if (!existing) throw new ApiError(404, "Vendor not found");
+  assertCanEdit(req, existing.created_by);
 
   const { data, error } = await supabase
     .from("vendors")
@@ -106,6 +134,16 @@ export async function updateVendor(req: Request, res: Response) {
 }
 
 export async function deleteVendor(req: Request, res: Response) {
+  const { data: existing, error: existingError } = await supabase
+    .from("vendors")
+    .select("created_by")
+    .eq("id", req.params.id)
+    .eq("store_id", req.storeId!)
+    .maybeSingle();
+  if (existingError) throw new ApiError(500, existingError.message);
+  if (!existing) throw new ApiError(404, "Vendor not found");
+  assertCanEdit(req, existing.created_by);
+
   const { error } = await supabase
     .from("vendors")
     .delete()

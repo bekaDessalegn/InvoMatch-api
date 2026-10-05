@@ -5,6 +5,7 @@ import { supabase } from "../db/supabase";
 import { ApiError } from "../middleware/errorHandler";
 import { signStoragePath } from "../services/storage";
 import { sortByCreatedAt } from "../utils/order";
+import { assertCanEdit, creatorScope, withCreatorNames } from "../utils/access";
 import { rollupDeliveryStatus } from "../utils/deliveryStatus";
 
 const lineItemSchema = z.object({
@@ -102,11 +103,13 @@ export async function listInvoices(req: Request, res: Response) {
   if (req.query.status) {
     query = query.eq("status", req.query.status as string);
   }
+  const ownerId = creatorScope(req);
+  if (ownerId) query = query.eq("created_by", ownerId);
 
   const { data, error } = await query;
   if (error) throw new ApiError(500, error.message);
   const withPhotos = await signInvoicePhotos(data ?? []);
-  res.json({ data: await attachDeliveryStatus(req.storeId!, withPhotos) });
+  res.json({ data: await attachDeliveryStatus(req.storeId!, await withCreatorNames(withPhotos)) });
 }
 
 export async function getInvoice(req: Request, res: Response) {
@@ -119,13 +122,16 @@ export async function getInvoice(req: Request, res: Response) {
 
   if (error) throw new ApiError(500, error.message);
   if (!data) throw new ApiError(404, "Invoice not found");
+  const ownerId = creatorScope(req);
+  if (ownerId && data.created_by !== ownerId) throw new ApiError(404, "Invoice not found");
   const ordered = {
     ...data,
     invoice_line_items: sortByCreatedAt(data.invoice_line_items),
   };
   const [withSignedPhoto] = await signInvoicePhotos([ordered]);
   const [withDeliveryStatus] = await attachDeliveryStatus(req.storeId!, [withSignedPhoto]);
-  res.json({ data: withDeliveryStatus });
+  const [named] = await withCreatorNames([withDeliveryStatus]);
+  res.json({ data: named });
 }
 
 export async function createInvoice(req: Request, res: Response) {
@@ -137,7 +143,7 @@ export async function createInvoice(req: Request, res: Response) {
 
   const { data: invoice, error: invoiceError } = await supabase
     .from("invoices")
-    .insert({ ...invoiceFields, store_id: storeId })
+    .insert({ ...invoiceFields, store_id: storeId, created_by: req.userId! })
     .select("*")
     .single();
 
@@ -165,13 +171,15 @@ export async function updateInvoice(req: Request, res: Response) {
   const parsed = updateInvoiceSchema.safeParse(req.body);
   if (!parsed.success) throw new ApiError(400, "Invalid invoice payload", parsed.error.flatten());
 
-  const { data, error } = await supabase
+  let query = supabase
     .from("invoices")
     .update(parsed.data)
     .eq("id", req.params.id)
-    .eq("store_id", req.storeId!)
-    .select("*")
-    .maybeSingle();
+    .eq("store_id", req.storeId!);
+  const ownerId = creatorScope(req);
+  if (ownerId) query = query.eq("created_by", ownerId);
+
+  const { data, error } = await query.select("*").maybeSingle();
 
   if (error) throw new ApiError(500, error.message);
   if (!data) throw new ApiError(404, "Invoice not found");
@@ -179,13 +187,13 @@ export async function updateInvoice(req: Request, res: Response) {
 }
 
 export async function deleteInvoice(req: Request, res: Response) {
-  const { error } = await supabase
-    .from("invoices")
-    .delete()
-    .eq("id", req.params.id)
-    .eq("store_id", req.storeId!);
+  let query = supabase.from("invoices").delete().eq("id", req.params.id).eq("store_id", req.storeId!);
+  const ownerId = creatorScope(req);
+  if (ownerId) query = query.eq("created_by", ownerId);
 
+  const { data, error } = await query.select("id");
   if (error) throw new ApiError(500, error.message);
+  if (!data?.length) throw new ApiError(404, "Invoice not found");
   res.status(204).send();
 }
 
@@ -210,6 +218,7 @@ export async function confirmInvoice(req: Request, res: Response) {
   if (invoiceError) throw new ApiError(500, invoiceError.message);
   if (!invoice) throw new ApiError(404, "Invoice not found");
   if (invoice.status === "confirmed") throw new ApiError(400, "Invoice is already confirmed");
+  assertCanEdit(req, invoice.created_by);
 
   const lineItems: { id: string; raw_name: string; unit_price: number; vendor_item_id: string | null }[] =
     invoice.invoice_line_items ?? [];
@@ -243,7 +252,11 @@ export async function confirmInvoice(req: Request, res: Response) {
     if (missingItemNames.length > 0) {
       const { data: createdItems, error: createItemsError } = await supabase
         .from("items")
-        .insert(missingItemNames.map((canonical_name) => ({ store_id: storeId, canonical_name })))
+        .insert(missingItemNames.map((canonical_name) => ({
+          store_id: storeId,
+          canonical_name,
+          created_by: req.userId!,
+        })))
         .select("id, canonical_name");
       if (createItemsError) throw new ApiError(500, createItemsError.message);
       for (const item of createdItems ?? []) {

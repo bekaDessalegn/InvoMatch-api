@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { supabase } from "../db/supabase";
 import { ApiError } from "../middleware/errorHandler";
+import { creatorScope, ownedInvoiceIds } from "../utils/access";
 
 interface PriceHistoryRow {
   item_id: string;
@@ -31,19 +32,32 @@ interface VendorItemRow {
  */
 export async function listPriceAlerts(req: Request, res: Response) {
   const storeId = req.storeId!;
+  const ownerId = creatorScope(req);
+  const invoiceIds = ownerId ? await ownedInvoiceIds(storeId, ownerId) : undefined;
+  if (invoiceIds && invoiceIds.length === 0) {
+    res.json({ data: [] });
+    return;
+  }
+
+  let historyQuery = supabase
+    .from("price_history")
+    .select("item_id, vendor_id, invoice_id, price, recorded_at, items(canonical_name), vendors(name), invoices(invoice_number)")
+    .eq("store_id", storeId)
+    .order("recorded_at", { ascending: false });
+  if (invoiceIds) historyQuery = historyQuery.in("invoice_id", invoiceIds);
 
   const [
     { data: history, error: historyError },
     { data: vendorItems, error: viError },
     { data: dismissals, error: dismissalError },
   ] = await Promise.all([
-    supabase
-      .from("price_history")
-      .select("item_id, vendor_id, invoice_id, price, recorded_at, items(canonical_name), vendors(name), invoices(invoice_number)")
-      .eq("store_id", storeId)
-      .order("recorded_at", { ascending: false }),
+    historyQuery,
     supabase.from("vendor_items").select("item_id, vendor_id, vendor_sku").eq("store_id", storeId),
-    supabase.from("price_alert_dismissals").select("item_id, vendor_id, invoice_id").eq("store_id", storeId),
+    supabase
+      .from("price_alert_dismissals")
+      .select("item_id, vendor_id, invoice_id")
+      .eq("store_id", storeId)
+      .eq("dismissed_by", req.userId!),
   ]);
 
   if (historyError) throw new ApiError(500, historyError.message);
@@ -126,16 +140,25 @@ const dismissPriceAlertSchema = z.object({
  */
 export async function dismissPriceAlert(req: Request, res: Response) {
   const parsed = dismissPriceAlertSchema.safeParse(req.body);
-  if (!parsed.success) throw new ApiError(400, "Invalid dismiss payload", parsed.error.flatten());
+  if (parsed.success === false) throw new ApiError(400, "Invalid dismiss payload", parsed.error.flatten());
+
+  const ownerId = creatorScope(req);
+  if (ownerId) {
+    const invoiceIds = await ownedInvoiceIds(req.storeId!, ownerId);
+    if (!invoiceIds.includes(parsed.data.source_invoice_id)) {
+      throw new ApiError(404, "Price alert not found");
+    }
+  }
 
   const { error } = await supabase.from("price_alert_dismissals").upsert(
     {
       store_id: req.storeId!,
+      dismissed_by: req.userId!,
       item_id: parsed.data.item_id,
       vendor_id: parsed.data.vendor_id,
       invoice_id: parsed.data.source_invoice_id,
     },
-    { onConflict: "store_id,item_id,vendor_id,invoice_id", ignoreDuplicates: true }
+    { onConflict: "store_id,dismissed_by,item_id,vendor_id,invoice_id", ignoreDuplicates: true }
   );
 
   if (error) throw new ApiError(500, error.message);

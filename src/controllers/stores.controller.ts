@@ -3,9 +3,11 @@ import { z } from "zod";
 
 import { supabase } from "../db/supabase";
 import { ApiError } from "../middleware/errorHandler";
+import { upsertProfile } from "../utils/access";
 
 const createStoreSchema = z.object({
   name: z.string().min(1, "Store name is required"),
+  full_name: z.string().min(1, "Your name is required"),
 });
 
 /**
@@ -47,6 +49,8 @@ export async function createStore(req: Request, res: Response) {
     await supabase.from("stores").delete().eq("id", store.id);
     throw new ApiError(500, memberError.message);
   }
+
+  await upsertProfile(req.userId!, req.userEmail ?? "", parsed.data.full_name);
 
   res.status(201).json({ data: { ...store, role: "owner" } });
 }

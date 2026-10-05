@@ -5,6 +5,7 @@ import { supabase } from "../db/supabase";
 import { ApiError } from "../middleware/errorHandler";
 import { signStoragePath } from "../services/storage";
 import { sortDeliveryLineItems } from "../utils/order";
+import { assertCanEdit, isManager, ownedInvoiceIds, withCreatorNames } from "../utils/access";
 import { type DeliveryLineForStatus, matchStatusForQuantity, rollupDeliveryStatus } from "../utils/deliveryStatus";
 
 const createDeliverySchema = z.object({
@@ -25,7 +26,7 @@ const upsertDeliveryLineItemSchema = z.object({
 });
 
 const DELIVERY_SELECT =
-  "*, invoices(invoice_number, vendor_id, vendors(name)), delivery_line_items(*, invoice_line_items(raw_name, quantity, unit_price, created_at))";
+  "*, invoices(invoice_number, vendor_id, created_by, vendors(name)), delivery_line_items(*, invoice_line_items(raw_name, quantity, unit_price, created_at))";
 
 /** Replaces each delivery's stored photo paths with short-lived signed URLs. */
 async function signDeliveryPhotos<T extends { photo_paths: string[] }>(
@@ -58,6 +59,14 @@ async function withRolledUpStatus<
   return next;
 }
 
+function canViewDelivery(
+  req: Request,
+  delivery: { created_by?: string | null; invoices?: { created_by?: string | null } | null }
+): boolean {
+  if (isManager(req.storeRole)) return true;
+  return delivery.created_by === req.userId || delivery.invoices?.created_by === req.userId;
+}
+
 export async function listDeliveries(req: Request, res: Response) {
   let query = supabase
     .from("deliveries")
@@ -71,12 +80,20 @@ export async function listDeliveries(req: Request, res: Response) {
   if (req.query.invoice_id) {
     query = query.eq("invoice_id", req.query.invoice_id as string);
   }
+  if (!isManager(req.storeRole)) {
+    const invoiceIds = await ownedInvoiceIds(req.storeId!, req.userId!);
+    query =
+      invoiceIds.length === 0
+        ? query.eq("created_by", req.userId!)
+        : query.or(`created_by.eq.${req.userId},invoice_id.in.(${invoiceIds.join(",")})`);
+  }
 
   const { data, error } = await query;
   if (error) throw new ApiError(500, error.message);
   const signed = await withRolledUpStatus(req.storeId!, await signDeliveryPhotos(data ?? []));
+  const named = await withCreatorNames(signed);
   res.json({
-    data: signed.map((delivery) => ({
+    data: named.map((delivery) => ({
       ...delivery,
       delivery_line_items: sortDeliveryLineItems(delivery.delivery_line_items),
     })),
@@ -93,11 +110,13 @@ export async function getDelivery(req: Request, res: Response) {
 
   if (error) throw new ApiError(500, error.message);
   if (!data) throw new ApiError(404, "Delivery not found");
+  if (!canViewDelivery(req, data)) throw new ApiError(404, "Delivery not found");
   const [withSignedPhoto] = await withRolledUpStatus(req.storeId!, await signDeliveryPhotos([data]));
+  const [named] = await withCreatorNames(withSignedPhoto ? [withSignedPhoto] : []);
   res.json({
     data: {
-      ...withSignedPhoto,
-      delivery_line_items: sortDeliveryLineItems(withSignedPhoto?.delivery_line_items),
+      ...named,
+      delivery_line_items: sortDeliveryLineItems(named?.delivery_line_items),
     },
   });
 }
@@ -106,9 +125,19 @@ export async function createDelivery(req: Request, res: Response) {
   const parsed = createDeliverySchema.safeParse(req.body);
   if (!parsed.success) throw new ApiError(400, "Invalid delivery payload", parsed.error.flatten());
 
+  const { data: invoice, error: invoiceError } = await supabase
+    .from("invoices")
+    .select("id, created_by")
+    .eq("id", parsed.data.invoice_id)
+    .eq("store_id", req.storeId!)
+    .maybeSingle();
+  if (invoiceError) throw new ApiError(500, invoiceError.message);
+  if (!invoice) throw new ApiError(404, "Invoice not found");
+  assertCanEdit(req, invoice.created_by);
+
   const { data, error } = await supabase
     .from("deliveries")
-    .insert({ ...parsed.data, store_id: req.storeId! })
+    .insert({ ...parsed.data, store_id: req.storeId!, created_by: req.userId! })
     .select(DELIVERY_SELECT)
     .single();
 
@@ -120,6 +149,16 @@ export async function createDelivery(req: Request, res: Response) {
 export async function updateDelivery(req: Request, res: Response) {
   const parsed = updateDeliverySchema.safeParse(req.body);
   if (!parsed.success) throw new ApiError(400, "Invalid delivery payload", parsed.error.flatten());
+
+  const { data: existing, error: existingError } = await supabase
+    .from("deliveries")
+    .select("created_by")
+    .eq("id", req.params.id)
+    .eq("store_id", req.storeId!)
+    .maybeSingle();
+  if (existingError) throw new ApiError(500, existingError.message);
+  if (!existing) throw new ApiError(404, "Delivery not found");
+  assertCanEdit(req, existing.created_by);
 
   const { data, error } = await supabase
     .from("deliveries")
@@ -135,6 +174,16 @@ export async function updateDelivery(req: Request, res: Response) {
 }
 
 export async function deleteDelivery(req: Request, res: Response) {
+  const { data: existing, error: existingError } = await supabase
+    .from("deliveries")
+    .select("created_by")
+    .eq("id", req.params.id)
+    .eq("store_id", req.storeId!)
+    .maybeSingle();
+  if (existingError) throw new ApiError(500, existingError.message);
+  if (!existing) throw new ApiError(404, "Delivery not found");
+  assertCanEdit(req, existing.created_by);
+
   const { error } = await supabase
     .from("deliveries")
     .delete()
@@ -153,13 +202,14 @@ export async function upsertDeliveryLineItems(req: Request, res: Response) {
   // Confirm the delivery belongs to this store before writing to it.
   const { data: delivery, error: deliveryError } = await supabase
     .from("deliveries")
-    .select("id")
+    .select("id, created_by")
     .eq("id", req.params.id)
     .eq("store_id", req.storeId!)
     .maybeSingle();
 
   if (deliveryError) throw new ApiError(500, deliveryError.message);
   if (!delivery) throw new ApiError(404, "Delivery not found");
+  assertCanEdit(req, delivery.created_by);
 
   const lineIds = parsed.data.map((li) => li.invoice_line_item_id);
   const { data: invoiceLines, error: linesError } = await supabase

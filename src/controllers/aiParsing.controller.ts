@@ -6,6 +6,7 @@ import { parseInvoiceDocument } from "../services/invoiceParsing";
 import { signStoragePath, uploadToStorage } from "../services/storage";
 import { ApiError } from "../middleware/errorHandler";
 import { sortByCreatedAt } from "../utils/order";
+import { assertCanEdit } from "../utils/access";
 
 /**
  * POST /invoices/parse
@@ -100,13 +101,14 @@ export async function analyzeDelivery(req: Request, res: Response) {
   const storeId = req.storeId!;
   const { data: invoice, error: invoiceError } = await supabase
     .from("invoices")
-    .select("id, invoice_line_items(id, raw_name, quantity, created_at)")
+    .select("id, created_by, invoice_line_items(id, raw_name, quantity, created_at)")
     .eq("id", invoiceId)
     .eq("store_id", storeId)
     .maybeSingle();
 
   if (invoiceError) throw new ApiError(500, invoiceError.message);
   if (!invoice) throw new ApiError(404, "Invoice not found");
+  assertCanEdit(req, invoice.created_by);
 
   const lineItems = sortByCreatedAt(
     (invoice.invoice_line_items ?? []) as { id: string; raw_name: string; quantity: number; created_at?: string | null }[]

@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { supabase } from "../db/supabase";
 import { ApiError } from "../middleware/errorHandler";
+import { assertCanEdit, creatorScope, ownedInvoiceIds, visibleItemIds } from "../utils/access";
 
 const createItemSchema = z.object({
   canonical_name: z.string().min(1),
@@ -32,15 +33,34 @@ interface VendorItemRow {
  * `sku` for display. Aggregated in JS from a couple of store-scoped queries
  * rather than a DB view, since catalog sizes here stay small.
  */
-async function attachItemAggregates(storeId: string, items: Record<string, unknown>[]) {
+async function attachItemAggregates(
+  storeId: string,
+  items: Record<string, unknown>[],
+  invoiceIds?: string[]
+) {
   if (items.length === 0) return items;
 
+  let historyQuery = supabase
+    .from("price_history")
+    .select("item_id, vendor_id, invoice_id, price, recorded_at, vendors(name)")
+    .eq("store_id", storeId)
+    .order("recorded_at", { ascending: false });
+  if (invoiceIds) {
+    if (invoiceIds.length === 0) {
+      return items.map((item) => ({
+        ...item,
+        current_cost: null,
+        previous_cost: null,
+        vendor_name: null,
+        sku: null,
+        last_invoice_date: null,
+      }));
+    }
+    historyQuery = historyQuery.in("invoice_id", invoiceIds);
+  }
+
   const [{ data: history, error: historyError }, { data: vendorItems, error: viError }] = await Promise.all([
-    supabase
-      .from("price_history")
-      .select("item_id, vendor_id, invoice_id, price, recorded_at, vendors(name)")
-      .eq("store_id", storeId)
-      .order("recorded_at", { ascending: false }),
+    historyQuery,
     supabase.from("vendor_items").select("item_id, vendor_id, vendor_sku").eq("store_id", storeId),
   ]);
 
@@ -84,14 +104,21 @@ async function attachItemAggregates(storeId: string, items: Record<string, unkno
 }
 
 export async function listItems(req: Request, res: Response) {
-  const { data, error } = await supabase
-    .from("items")
-    .select("*")
-    .eq("store_id", req.storeId!)
-    .order("canonical_name", { ascending: true });
+  const ownerId = creatorScope(req);
+  let query = supabase.from("items").select("*").eq("store_id", req.storeId!).order("canonical_name", { ascending: true });
+  if (ownerId) {
+    const ids = await visibleItemIds(req.storeId!, ownerId);
+    if (ids.length === 0) {
+      res.json({ data: [] });
+      return;
+    }
+    query = query.in("id", ids);
+  }
 
+  const { data, error } = await query;
   if (error) throw new ApiError(500, error.message);
-  res.json({ data: await attachItemAggregates(req.storeId!, data ?? []) });
+  const invoiceIds = ownerId ? await ownedInvoiceIds(req.storeId!, ownerId) : undefined;
+  res.json({ data: await attachItemAggregates(req.storeId!, data ?? [], invoiceIds) });
 }
 
 export async function getItem(req: Request, res: Response) {
@@ -104,17 +131,38 @@ export async function getItem(req: Request, res: Response) {
 
   if (error) throw new ApiError(500, error.message);
   if (!data) throw new ApiError(404, "Item not found");
-  const [withAggregates] = await attachItemAggregates(req.storeId!, [data]);
+  const ownerId = creatorScope(req);
+  if (ownerId && !(await visibleItemIds(req.storeId!, ownerId)).includes(data.id)) {
+    throw new ApiError(404, "Item not found");
+  }
+  const invoiceIds = ownerId ? await ownedInvoiceIds(req.storeId!, ownerId) : undefined;
+  const [withAggregates] = await attachItemAggregates(req.storeId!, [data], invoiceIds);
   res.json({ data: withAggregates });
 }
 
 export async function getItemPriceHistory(req: Request, res: Response) {
-  const { data, error } = await supabase
+  const itemId = req.params.id as string;
+  const ownerId = creatorScope(req);
+  if (ownerId && !(await visibleItemIds(req.storeId!, ownerId)).includes(itemId)) {
+    throw new ApiError(404, "Item not found");
+  }
+
+  let historyQuery = supabase
     .from("price_history")
     .select("price, recorded_at, invoice_id, invoices(invoice_number)")
-    .eq("item_id", req.params.id)
+    .eq("item_id", itemId)
     .eq("store_id", req.storeId!)
     .order("recorded_at", { ascending: true });
+  if (ownerId) {
+    const invoiceIds = await ownedInvoiceIds(req.storeId!, ownerId);
+    if (invoiceIds.length === 0) {
+      res.json({ data: [] });
+      return;
+    }
+    historyQuery = historyQuery.in("invoice_id", invoiceIds);
+  }
+
+  const { data, error } = await historyQuery;
 
   if (error) throw new ApiError(500, error.message);
 
@@ -136,7 +184,7 @@ export async function createItem(req: Request, res: Response) {
 
   const { data, error } = await supabase
     .from("items")
-    .insert({ ...parsed.data, store_id: req.storeId! })
+    .insert({ ...parsed.data, store_id: req.storeId!, created_by: req.userId! })
     .select("*")
     .single();
 
@@ -147,6 +195,16 @@ export async function createItem(req: Request, res: Response) {
 export async function updateItem(req: Request, res: Response) {
   const parsed = updateItemSchema.safeParse(req.body);
   if (!parsed.success) throw new ApiError(400, "Invalid item payload", parsed.error.flatten());
+
+  const { data: existing, error: existingError } = await supabase
+    .from("items")
+    .select("created_by")
+    .eq("id", req.params.id)
+    .eq("store_id", req.storeId!)
+    .maybeSingle();
+  if (existingError) throw new ApiError(500, existingError.message);
+  if (!existing) throw new ApiError(404, "Item not found");
+  assertCanEdit(req, existing.created_by);
 
   const { data, error } = await supabase
     .from("items")
@@ -162,11 +220,17 @@ export async function updateItem(req: Request, res: Response) {
 }
 
 export async function deleteItem(req: Request, res: Response) {
-  const { error } = await supabase
+  const { data: existing, error: existingError } = await supabase
     .from("items")
-    .delete()
+    .select("created_by")
     .eq("id", req.params.id)
-    .eq("store_id", req.storeId!);
+    .eq("store_id", req.storeId!)
+    .maybeSingle();
+  if (existingError) throw new ApiError(500, existingError.message);
+  if (!existing) throw new ApiError(404, "Item not found");
+  assertCanEdit(req, existing.created_by);
+
+  const { error } = await supabase.from("items").delete().eq("id", req.params.id).eq("store_id", req.storeId!);
 
   if (error) throw new ApiError(500, error.message);
   res.status(204).send();

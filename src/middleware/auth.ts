@@ -52,6 +52,14 @@ export async function requireStore(req: Request, _res: Response, next: NextFunct
   if (!data) throw new ApiError(403, "You don't belong to a store yet. Create one via POST /api/stores.");
 
   req.storeId = data.store_id;
-  req.storeRole = data.role as "owner" | "keeper";
+  req.storeRole = data.role as "owner" | "admin" | "worker";
+  next();
+}
+
+/** Owners and admins manage the team and see every record. Workers do not. */
+export async function requireManager(req: Request, _res: Response, next: NextFunction): Promise<void> {
+  if (req.storeRole !== "owner" && req.storeRole !== "admin") {
+    throw new ApiError(403, "Only an owner or admin can do that");
+  }
   next();
 }
