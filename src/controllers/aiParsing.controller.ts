@@ -7,6 +7,7 @@ import { signStoragePath, uploadToStorage } from "../services/storage";
 import { ApiError } from "../middleware/errorHandler";
 import { sortByCreatedAt } from "../utils/order";
 import { assertCanEdit } from "../utils/access";
+import { beginScan, refundScan } from "../services/billing";
 
 /**
  * POST /invoices/parse
@@ -32,7 +33,21 @@ export async function parseInvoice(req: Request, res: Response) {
   const firstFile = files[0]!;
 
   const storeId = req.storeId!;
-  const result = await parseInvoiceDocument(files.map((f) => ({ buffer: f.buffer, mimetype: f.mimetype })));
+  const hold = await beginScan(storeId);
+  let released = false;
+  const release = async () => {
+    if (released) return;
+    released = true;
+    await refundScan(hold);
+  };
+  let result;
+  try {
+    result = await parseInvoiceDocument(files.map((f) => ({ buffer: f.buffer, mimetype: f.mimetype })));
+    if (!result.isInvoice || result.lineItems.length === 0) await release();
+  } catch (error) {
+    await release();
+    throw error;
+  }
 
   if (!result.isInvoice) {
     throw new ApiError(422, result.rejectionReason ?? "This doesn't look like a valid invoice. Please retake it.");
@@ -117,11 +132,25 @@ export async function analyzeDelivery(req: Request, res: Response) {
     throw new ApiError(400, "This invoice has no line items to match a delivery against.");
   }
 
-  const expectedItems = lineItems.map((li, index) => ({ index, name: li.raw_name, expectedQuantity: li.quantity }));
-  const result = await analyzeDeliveryPhoto(
-    files.map((f) => ({ buffer: f.buffer, mimetype: f.mimetype })),
-    expectedItems
-  );
+  const hold = await beginScan(storeId);
+  let released = false;
+  const release = async () => {
+    if (released) return;
+    released = true;
+    await refundScan(hold);
+  };
+  let result;
+  try {
+    const expectedItems = lineItems.map((li, index) => ({ index, name: li.raw_name, expectedQuantity: li.quantity }));
+    result = await analyzeDeliveryPhoto(
+      files.map((f) => ({ buffer: f.buffer, mimetype: f.mimetype })),
+      expectedItems
+    );
+    if (!result.isDeliveryPhoto) await release();
+  } catch (error) {
+    await release();
+    throw error;
+  }
 
   if (!result.isDeliveryPhoto) {
     throw new ApiError(422, result.rejectionReason ?? "This doesn't look like a photo of the delivery. Please retake it.");

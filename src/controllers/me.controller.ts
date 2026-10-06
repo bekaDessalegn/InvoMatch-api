@@ -2,6 +2,8 @@ import type { Request, Response } from "express";
 
 import { supabase } from "../db/supabase";
 import { ApiError } from "../middleware/errorHandler";
+import { billingSnapshot } from "../services/billing";
+import { stripeReady } from "../services/stripeBilling";
 
 /**
  * GET /api/me
@@ -19,10 +21,14 @@ export async function getMe(req: Request, res: Response) {
 
   if (error) throw new ApiError(500, error.message);
 
+  const store = data?.stores as { id?: string } | null;
+  const billing = store?.id ? { ...(await billingSnapshot(store.id)), stripe_ready: stripeReady() } : null;
+
   res.json({
     data: {
       user: { id: req.userId, email: req.userEmail },
       store: data ? { ...data.stores, role: data.role } : null,
+      billing,
     },
   });
 }

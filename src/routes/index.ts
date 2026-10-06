@@ -1,5 +1,7 @@
 import { Router } from "express";
 
+import { adminRouter } from "./admin.routes";
+import { billingRouter } from "./billing.routes";
 import { deliveriesRouter } from "./deliveries.routes";
 import { invitesRouter } from "./invites.routes";
 import { invoicesRouter } from "./invoices.routes";
@@ -15,6 +17,8 @@ export const apiRouter = Router();
 // Auth/onboarding — require a valid session but (deliberately) not yet a
 // store membership, since /stores is how a new user creates their first one.
 apiRouter.use("/me", meRouter);
+apiRouter.use("/billing", billingRouter);
+apiRouter.use("/admin", adminRouter);
 apiRouter.use("/stores", storesRouter);
 apiRouter.use("/invites", invitesRouter);
 apiRouter.use("/team", teamRouter);

@@ -34,4 +34,22 @@ export const env = {
   anthropicModel: optional("ANTHROPIC_MODEL", "claude-sonnet-5"),
 
   corsOrigin: optional("CORS_ORIGIN", "*"),
+
+  // Comma-separated emails that may open the super admin site. The first
+  // time one of them signs in, they are saved as a platform admin.
+  platformAdminEmails: optional("PLATFORM_ADMIN_EMAILS", "")
+    .split(",")
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean),
+
+  publicBaseUrl: optional("PUBLIC_BASE_URL", "http://localhost:4000"),
+
+  stripeSecretKey: optional("STRIPE_SECRET_KEY", ""),
+  stripeWebhookSecret: optional("STRIPE_WEBHOOK_SECRET", ""),
+  stripePriceStarter: optional("STRIPE_PRICE_STARTER", ""),
+  stripePriceStandard: optional("STRIPE_PRICE_STANDARD", ""),
+  stripePricePlus: optional("STRIPE_PRICE_PLUS", ""),
+  stripePriceScan1: optional("STRIPE_PRICE_SCAN_1", ""),
+  stripePriceScan5: optional("STRIPE_PRICE_SCAN_5", ""),
+  stripePriceScan10: optional("STRIPE_PRICE_SCAN_10", ""),
 };
