@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import { ApiError } from "../middleware/errorHandler";
 import { billingSnapshot, isPlanId, isTopupId } from "../services/billing";
-import { createCheckout, createPortal, fulfillCheckoutSession, stripeReady } from "../services/stripeBilling";
+import { applyListedPrices, createCheckout, createPortal, fulfillCheckoutSession, stripeReady } from "../services/stripeBilling";
 
 const checkoutSchema = z.object({
   plan: z.enum(["starter", "standard", "plus"]).optional(),
@@ -12,7 +12,7 @@ const checkoutSchema = z.object({
 
 /** GET /billing — plan, scan balances, and whether the paywall is on. */
 export async function getBilling(req: Request, res: Response) {
-  const snapshot = await billingSnapshot(req.storeId!);
+  const snapshot = await applyListedPrices(await billingSnapshot(req.storeId!));
   res.json({ data: { ...snapshot, stripe_ready: stripeReady() } });
 }
 

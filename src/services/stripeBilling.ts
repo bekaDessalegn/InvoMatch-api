@@ -6,6 +6,7 @@ import { ApiError } from "../middleware/errorHandler";
 import {
   type PlanId,
   type TopupId,
+  PLANS,
   TOPUPS,
   grantTopup,
   isPlanId,
@@ -59,6 +60,71 @@ function planForPrice(priceId: string): PlanId | null {
 function stripeClient(): Stripe {
   if (!env.stripeSecretKey) throw new ApiError(503, "Stripe is not configured yet.");
   return new Stripe(env.stripeSecretKey);
+}
+
+let listedPriceCache: { at: number; amounts: Partial<Record<PlanId | TopupId, number>> } | null = null;
+let warnedAboutPublishableKey = false;
+
+/** Amounts charged by the price IDs in the environment, in cents. */
+async function listedAmounts(): Promise<Partial<Record<PlanId | TopupId, number>> | null> {
+  const key = env.stripeSecretKey;
+  if (!key.startsWith("sk_") && !key.startsWith("rk_")) {
+    if (key && !warnedAboutPublishableKey) {
+      warnedAboutPublishableKey = true;
+      console.error(
+        "STRIPE_SECRET_KEY is a publishable key. Plan prices in the app stay at the built-in amounts until this is the secret key (sk_live_...).",
+      );
+    }
+    return null;
+  }
+  if (listedPriceCache && Date.now() - listedPriceCache.at < 60_000) return listedPriceCache.amounts;
+
+  const ids: Array<[PlanId | TopupId, string]> = [
+    ["starter", env.stripePriceStarter],
+    ["standard", env.stripePriceStandard],
+    ["plus", env.stripePricePlus],
+    ["scan_1", env.stripePriceScan1],
+    ["scan_5", env.stripePriceScan5],
+    ["scan_10", env.stripePriceScan10],
+  ];
+
+  try {
+    const stripe = stripeClient();
+    const amounts: Partial<Record<PlanId | TopupId, number>> = {};
+    await Promise.all(
+      ids.map(async ([name, id]) => {
+        if (!id) return;
+        const price = await stripe.prices.retrieve(id);
+        if (typeof price.unit_amount === "number") amounts[name] = price.unit_amount;
+      }),
+    );
+    listedPriceCache = { at: Date.now(), amounts };
+    return amounts;
+  } catch (error) {
+    console.error("Could not load Stripe prices", error instanceof Error ? error.message : error);
+    return null;
+  }
+}
+
+/** Replace the built-in dollar amounts with the amounts on the live Stripe prices. */
+export async function applyListedPrices<T extends { plans: typeof PLANS; topups: typeof TOPUPS }>(
+  snapshot: T,
+): Promise<T> {
+  const amounts = await listedAmounts();
+  if (!amounts) return snapshot;
+  return {
+    ...snapshot,
+    plans: {
+      starter: { ...snapshot.plans.starter, amountCents: amounts.starter ?? snapshot.plans.starter.amountCents },
+      standard: { ...snapshot.plans.standard, amountCents: amounts.standard ?? snapshot.plans.standard.amountCents },
+      plus: { ...snapshot.plans.plus, amountCents: amounts.plus ?? snapshot.plans.plus.amountCents },
+    },
+    topups: {
+      scan_1: { ...snapshot.topups.scan_1, amountCents: amounts.scan_1 ?? snapshot.topups.scan_1.amountCents },
+      scan_5: { ...snapshot.topups.scan_5, amountCents: amounts.scan_5 ?? snapshot.topups.scan_5.amountCents },
+      scan_10: { ...snapshot.topups.scan_10, amountCents: amounts.scan_10 ?? snapshot.topups.scan_10.amountCents },
+    },
+  };
 }
 
 export async function createCheckout(input: {

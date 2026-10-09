@@ -21,6 +21,8 @@ const TOPUP_DAYS = 90;
 
 export type ScanHold = { skipped: true } | { skipped: false; lotId: string };
 
+export type SubscriptionOverride = "on" | "off" | null;
+
 interface StoreBillingRow {
   id: string;
   name: string;
@@ -29,6 +31,14 @@ interface StoreBillingRow {
   grace_until: string | null;
   stripe_customer_id: string | null;
   stripe_subscription_id: string | null;
+  subscription_override: SubscriptionOverride;
+}
+
+/** A store follows the platform switch unless an admin set it on or off. */
+export function subscriptionEnforced(platformOn: boolean, override: SubscriptionOverride): boolean {
+  if (override === "on") return true;
+  if (override === "off") return false;
+  return platformOn;
 }
 
 export function isPlanId(value: string): value is PlanId {
@@ -68,11 +78,13 @@ export async function setSubscriptionMode(enabled: boolean): Promise<{ subscript
 async function loadStore(storeId: string): Promise<StoreBillingRow> {
   const { data, error } = await supabase
     .from("stores")
-    .select("id, name, subscription_status, subscription_plan, grace_until, stripe_customer_id, stripe_subscription_id")
+    .select("id, name, subscription_status, subscription_plan, grace_until, stripe_customer_id, stripe_subscription_id, subscription_override")
     .eq("id", storeId)
     .single();
   if (error) throw new ApiError(500, error.message);
-  return data as StoreBillingRow;
+  const row = data as StoreBillingRow;
+  row.subscription_override = row.subscription_override === "on" || row.subscription_override === "off" ? row.subscription_override : null;
+  return row;
 }
 
 function inGrace(store: StoreBillingRow): boolean {
@@ -105,7 +117,7 @@ export async function scanBalances(storeId: string): Promise<{ plan: number; top
 export async function billingSnapshot(storeId: string) {
   const [settings, store, balances] = await Promise.all([getSettings(), loadStore(storeId), scanBalances(storeId)]);
   return {
-    subscription_mode: settings.subscription_mode,
+    subscription_mode: subscriptionEnforced(settings.subscription_mode, store.subscription_override),
     plan: store.subscription_plan,
     status: store.subscription_status,
     grace_until: store.grace_until,
@@ -119,15 +131,14 @@ export async function billingSnapshot(storeId: string) {
 }
 
 /**
- * Call before a Claude scan. When subscription mode is off, or the store is
- * inside the grace window and has not subscribed, nothing is reserved.
+ * Call before a Claude scan. When this store is not required to subscribe,
+ * or it is inside the grace window and has not subscribed, nothing is reserved.
  * A reserved scan must be refunded if the scan fails.
  */
 export async function beginScan(storeId: string): Promise<ScanHold> {
-  const settings = await getSettings();
-  if (!settings.subscription_mode) return { skipped: true };
+  const [settings, store] = await Promise.all([getSettings(), loadStore(storeId)]);
+  if (!subscriptionEnforced(settings.subscription_mode, store.subscription_override)) return { skipped: true };
 
-  const store = await loadStore(storeId);
   if (!isPaying(store)) {
     if (inGrace(store)) return { skipped: true };
     throw new ApiError(
@@ -299,6 +310,25 @@ export async function markSubscribed(input: {
     })
     .eq("id", input.storeId);
   if (error) throw new ApiError(500, error.message);
+}
+
+export async function setStoreSubscriptionOverride(
+  storeId: string,
+  override: SubscriptionOverride,
+): Promise<{ subscription_override: SubscriptionOverride; grace_until: string | null; subscription_enforced: boolean }> {
+  const [settings, store] = await Promise.all([getSettings(), loadStore(storeId)]);
+  const patch: { subscription_override: SubscriptionOverride; grace_until?: string } = { subscription_override: override };
+  if (override === "on" && !store.grace_until && !isPaying(store)) {
+    patch.grace_until = new Date(Date.now() + GRACE_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  }
+  const { error } = await supabase.from("stores").update(patch).eq("id", storeId);
+  if (error) throw new ApiError(500, error.message);
+  const updated = await loadStore(storeId);
+  return {
+    subscription_override: updated.subscription_override,
+    grace_until: updated.grace_until,
+    subscription_enforced: subscriptionEnforced(settings.subscription_mode, updated.subscription_override),
+  };
 }
 
 export async function markCanceled(storeId: string): Promise<void> {
