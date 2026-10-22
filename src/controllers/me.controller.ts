@@ -15,7 +15,7 @@ import { applyListedPrices, stripeReady } from "../services/stripeBilling";
 export async function getMe(req: Request, res: Response) {
   const { data, error } = await supabase
     .from("store_members")
-    .select("role, stores(id, name, subscription_status, subscription_plan, created_at)")
+    .select("role, stores(id, name, subscription_status, subscription_plan, target_margin_percent, created_at)")
     .eq("user_id", req.userId!)
     .maybeSingle();
 

@@ -5,9 +5,15 @@ import { supabase } from "../db/supabase";
 import { ApiError } from "../middleware/errorHandler";
 import { upsertProfile } from "../utils/access";
 
+const marginField = z
+  .number()
+  .gt(0, "Enter a margin above 0.")
+  .lt(100, "Margin has to stay under 100, or the shelf price cannot be calculated.");
+
 const createStoreSchema = z.object({
   name: z.string().min(1, "Store name is required"),
   full_name: z.string().min(1, "Your name is required"),
+  target_margin_percent: marginField,
 });
 
 /**
@@ -34,7 +40,7 @@ export async function createStore(req: Request, res: Response) {
 
   const { data: store, error: storeError } = await supabase
     .from("stores")
-    .insert({ name: parsed.data.name })
+    .insert({ name: parsed.data.name, target_margin_percent: parsed.data.target_margin_percent })
     .select("*")
     .single();
 
@@ -53,4 +59,23 @@ export async function createStore(req: Request, res: Response) {
   await upsertProfile(req.userId!, req.userEmail ?? "", parsed.data.full_name);
 
   res.status(201).json({ data: { ...store, role: "owner" } });
+}
+
+const updateMarginSchema = z.object({
+  target_margin_percent: marginField,
+});
+
+/** PATCH /stores/margin — owners and admins can change the store's target margin. */
+export async function updateStoreMargin(req: Request, res: Response) {
+  const parsed = updateMarginSchema.safeParse(req.body);
+  if (!parsed.success) throw new ApiError(400, "Enter a margin between 0 and 100.", parsed.error.flatten());
+
+  const { data, error } = await supabase
+    .from("stores")
+    .update({ target_margin_percent: parsed.data.target_margin_percent })
+    .eq("id", req.storeId!)
+    .select("id, name, subscription_status, subscription_plan, target_margin_percent")
+    .single();
+  if (error) throw new ApiError(500, error.message);
+  res.json({ data: { ...data, role: req.storeRole } });
 }
