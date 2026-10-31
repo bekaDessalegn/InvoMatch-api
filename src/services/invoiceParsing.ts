@@ -1,11 +1,13 @@
 import type Anthropic from "@anthropic-ai/sdk";
 
 import { anthropic, CLAUDE_MODEL } from "./anthropic";
+import { inferPackQuantity } from "../utils/packQuantity";
 
 export interface ParsedInvoiceLineItem {
   name: string;
   quantity: number;
   unit_price: number;
+  units_in_package: number | null;
 }
 
 export interface ParsedInvoiceResult {
@@ -58,6 +60,11 @@ const invoiceTool: Anthropic.Tool = {
               description:
                 "Price per unit the store actually pays. If the invoice has Price/Disc/Net columns, use Net — not the pre-discount Price and not the line Total.",
             },
+            units_in_package: {
+              type: "number",
+              description:
+                "How many individual retail units (cans, bottles, or items) are inside ONE priced package. If unit_price is the price of a single can, use 1. If unit_price is the price of a 12-can case, use 12. A line printed 4/6/12 OZ is 4 six-packs, so 24. Do not use the line quantity. Omit this when the package size is not printed.",
+            },
           },
           required: ["name", "quantity", "unit_price"],
         },
@@ -99,6 +106,8 @@ function extractionPrompt(fileCount: number, isPdf: boolean): string {
     "page 1 first; do not sort alphabetically, by price, or by quantity. Skip barcodes, UPC numbers, pallet IDs, " +
     "headers, signatures, and out-of-stock / $0.00 total rows. If the invoice has Price, Discount, and Net columns, unit_price " +
     "must be the Net (what the store pays), not the pre-discount Price and not the line Total. " +
+    "For each line, set units_in_package to the number of individual cans, bottles, or items inside the priced package " +
+    "(a case of 12 is 12; a single can is 1; 4/6/12 OZ is 24). Omit it when the invoice does not say. " +
     "Do not stop after the first page. If any totals aren't printed, compute subtotal as the sum of line totals and leave tax as 0 " +
     "unless a tax amount is visible. If it's not a valid invoice, set is_invoice to false and explain why in rejection_reason " +
     "instead of guessing at data."
@@ -129,11 +138,17 @@ function parseToolInput(input: Record<string, unknown>): ParsedInvoiceResult {
     invoiceDate: (input.invoice_date as string) ?? null,
     lineItems: Array.isArray(input.line_items)
       ? (input.line_items as ParsedInvoiceLineItem[])
-          .map((li) => ({
-            name: String(li.name ?? "").trim() || "Unlabeled item",
-            quantity: Number(li.quantity) || 0,
-            unit_price: Number(li.unit_price) || 0,
-          }))
+          .map((li) => {
+            const name = String(li.name ?? "").trim() || "Unlabeled item";
+            const stated = Number((li as { units_in_package?: unknown }).units_in_package);
+            const pack = Number.isFinite(stated) && stated > 0 ? stated : inferPackQuantity(name);
+            return {
+              name,
+              quantity: Number(li.quantity) || 0,
+              unit_price: Number(li.unit_price) || 0,
+              units_in_package: pack,
+            };
+          })
           .filter((li) => li.quantity > 0)
       : [],
     subtotal: Number(input.subtotal) || 0,

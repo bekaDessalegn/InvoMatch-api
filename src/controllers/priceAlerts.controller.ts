@@ -4,12 +4,14 @@ import { z } from "zod";
 import { supabase } from "../db/supabase";
 import { ApiError } from "../middleware/errorHandler";
 import { creatorScope, ownedInvoiceIds } from "../utils/access";
+import { inferPackQuantity } from "../utils/packQuantity";
 
 interface PriceHistoryRow {
   item_id: string;
   vendor_id: string;
   invoice_id: string;
   price: number;
+  pack_quantity: number | null;
   recorded_at: string;
   items: { canonical_name: string } | null;
   vendors: { name: string } | null;
@@ -42,7 +44,7 @@ export async function listPriceAlerts(req: Request, res: Response) {
 
   let historyQuery = supabase
     .from("price_history")
-    .select("item_id, vendor_id, invoice_id, price, recorded_at, items(canonical_name), vendors(name), invoices(invoice_number)")
+    .select("item_id, vendor_id, invoice_id, price, pack_quantity, recorded_at, items(canonical_name), vendors(name), invoices(invoice_number)")
     .eq("store_id", storeId)
     .order("recorded_at", { ascending: false });
   if (invoiceIds) historyQuery = historyQuery.in("invoice_id", invoiceIds);
@@ -104,9 +106,15 @@ export async function listPriceAlerts(req: Request, res: Response) {
   for (const rows of byItem.values()) {
     if (rows.length < 2) continue;
     const [latest, previous, earlier] = rows as [PriceHistoryRow, PriceHistoryRow, PriceHistoryRow?];
-    if (Number(latest.price) === Number(previous.price)) continue;
+    const latestCost = comparableCost(latest);
+    const previousCost = comparableCost(previous);
+    // A can and a case are not the same price. Skip the alert until both
+    // sides are priced the same way, instead of reporting $3 vs $40.
+    if (latestCost.perUnit !== previousCost.perUnit) continue;
+    if (money(latestCost.amount) === money(previousCost.amount)) continue;
     if (dismissedTriggers.has(`${latest.item_id}:${latest.vendor_id}:${latest.invoice_id}`)) continue;
 
+    const earlierCost = earlier ? comparableCost(earlier) : null;
     alerts.push({
       item_id: latest.item_id,
       item_name: latest.items?.canonical_name ?? "Unknown item",
@@ -114,10 +122,12 @@ export async function listPriceAlerts(req: Request, res: Response) {
       vendor_id: latest.vendor_id,
       vendor_name: latest.vendors?.name ?? "Unknown vendor",
       previous_vendor_name: previous.vendors?.name ?? "Unknown vendor",
-      earlier_price: earlier ? Number(earlier.price) : null,
-      previous_price: Number(previous.price),
-      new_price: Number(latest.price),
-      suggested_price: suggestedShelfPrice(Number(latest.price), margin),
+      price_basis: latestCost.perUnit ? "each" : "package",
+      margin_percent: margin,
+      earlier_price: earlierCost && earlierCost.perUnit === latestCost.perUnit ? money(earlierCost.amount) : null,
+      previous_price: money(previousCost.amount),
+      new_price: money(latestCost.amount),
+      suggested_price: suggestedShelfPrice(latestCost.amount, margin),
       source_invoice_id: latest.invoice_id,
       source_invoice_number: latest.invoices?.invoice_number ?? null,
       changed_at: latest.recorded_at,
@@ -126,6 +136,18 @@ export async function listPriceAlerts(req: Request, res: Response) {
 
   alerts.sort((a, b) => new Date(b.changed_at).getTime() - new Date(a.changed_at).getTime());
   res.json({ data: alerts });
+}
+
+function money(amount: number): number {
+  return Math.round(amount * 100) / 100;
+}
+
+/** Package price divided by the units in that package, when the size is known. */
+function comparableCost(row: PriceHistoryRow): { amount: number; perUnit: boolean } {
+  const stored = row.pack_quantity == null ? null : Number(row.pack_quantity);
+  const pack = stored != null && stored > 0 ? stored : inferPackQuantity(row.items?.canonical_name ?? "");
+  if (pack != null && pack > 0) return { amount: Number(row.price) / pack, perUnit: true };
+  return { amount: Number(row.price), perUnit: false };
 }
 
 /** Shelf price that keeps [marginPercent] of the selling price as profit. */

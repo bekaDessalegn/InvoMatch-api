@@ -144,6 +144,19 @@ export async function deleteVendor(req: Request, res: Response) {
   if (!existing) throw new ApiError(404, "Vendor not found");
   assertCanEdit(req, existing.created_by);
 
+  const { count, error: countError } = await supabase
+    .from("invoices")
+    .select("id", { count: "exact", head: true })
+    .eq("store_id", req.storeId!)
+    .eq("vendor_id", req.params.id);
+  if (countError) throw new ApiError(500, countError.message);
+  if ((count ?? 0) > 0) {
+    throw new ApiError(
+      409,
+      "This supplier has invoices, so it can't be deleted. Archive it instead. The invoices stay on the store."
+    );
+  }
+
   const { error } = await supabase
     .from("vendors")
     .delete()

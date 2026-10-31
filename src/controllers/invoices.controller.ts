@@ -5,14 +5,17 @@ import { supabase } from "../db/supabase";
 import { ApiError } from "../middleware/errorHandler";
 import { signStoragePath } from "../services/storage";
 import { sortByCreatedAt } from "../utils/order";
-import { assertCanEdit, creatorScope, withCreatorNames } from "../utils/access";
+import { assertCanChangeInvoice, assertCanEdit, creatorScope, withCreatorNames } from "../utils/access";
 import { rollupDeliveryStatus } from "../utils/deliveryStatus";
+import { inferPackQuantity } from "../utils/packQuantity";
 
 const lineItemSchema = z.object({
+  id: z.string().uuid().optional(),
   vendor_item_id: z.string().uuid().nullable().optional(),
   raw_name: z.string().min(1),
   quantity: z.number(),
   unit_price: z.number(),
+  pack_quantity: z.number().positive().nullable().optional(),
 });
 
 const createInvoiceSchema = z.object({
@@ -29,9 +32,15 @@ const createInvoiceSchema = z.object({
   line_items: z.array(lineItemSchema).optional().default([]),
 });
 
-const updateInvoiceSchema = createInvoiceSchema
-  .omit({ line_items: true })
-  .partial();
+const updateInvoiceSchema = z.object({
+  vendor_id: z.string().uuid().optional(),
+  invoice_number: z.string().min(1).optional(),
+  invoice_date: z.string().optional(),
+  subtotal: z.number().optional(),
+  tax: z.number().optional(),
+  total: z.number().optional(),
+  line_items: z.array(lineItemSchema).min(1).optional(),
+});
 
 /** Replaces each invoice's stored photo paths with short-lived signed URLs. */
 async function signInvoicePhotos<T extends { photo_paths: string[] }>(
@@ -152,7 +161,11 @@ export async function createInvoice(req: Request, res: Response) {
   if (line_items.length > 0) {
     const stamp = Date.now();
     const rows = line_items.map((li, index) => ({
-      ...li,
+      vendor_item_id: li.vendor_item_id,
+      raw_name: li.raw_name,
+      quantity: li.quantity,
+      unit_price: li.unit_price,
+      pack_quantity: li.pack_quantity === undefined ? inferPackQuantity(li.raw_name) : li.pack_quantity,
       invoice_id: invoice.id,
       store_id: storeId,
       total_price: li.quantity * li.unit_price,
@@ -171,30 +184,119 @@ export async function updateInvoice(req: Request, res: Response) {
   const parsed = updateInvoiceSchema.safeParse(req.body);
   if (!parsed.success) throw new ApiError(400, "Invalid invoice payload", parsed.error.flatten());
 
-  let query = supabase
+  const storeId = req.storeId!;
+  const { data: existing, error: existingError } = await supabase
     .from("invoices")
-    .update(parsed.data)
+    .select("id, created_by, status, vendor_id, invoice_date")
     .eq("id", req.params.id)
-    .eq("store_id", req.storeId!);
-  const ownerId = creatorScope(req);
-  if (ownerId) query = query.eq("created_by", ownerId);
+    .eq("store_id", storeId)
+    .maybeSingle();
+  if (existingError) throw new ApiError(500, existingError.message);
+  if (!existing) throw new ApiError(404, "Invoice not found");
+  await assertCanChangeInvoice(req, existing);
 
-  const { data, error } = await query.select("*").maybeSingle();
+  const { line_items: lineItems, ...fields } = parsed.data;
+  if (Object.keys(fields).length > 0) {
+    const { error } = await supabase.from("invoices").update(fields).eq("id", existing.id).eq("store_id", storeId);
+    if (error) throw new ApiError(500, error.message);
+  }
+  if (lineItems) await replaceInvoiceLines(storeId, existing.id, lineItems);
 
+  if (existing.status === "confirmed") {
+    const { error: clearError } = await supabase
+      .from("price_history")
+      .delete()
+      .eq("invoice_id", existing.id)
+      .eq("store_id", storeId);
+    if (clearError) throw new ApiError(500, clearError.message);
+
+    const { data: fresh, error: freshError } = await supabase
+      .from("invoices")
+      .select("*, invoice_line_items(*)")
+      .eq("id", existing.id)
+      .eq("store_id", storeId)
+      .single();
+    if (freshError) throw new ApiError(500, freshError.message);
+    await writePriceHistory(req, fresh);
+  }
+
+  const { data, error } = await supabase
+    .from("invoices")
+    .select("*, vendors(name), invoice_line_items(*)")
+    .eq("id", existing.id)
+    .eq("store_id", storeId)
+    .single();
   if (error) throw new ApiError(500, error.message);
-  if (!data) throw new ApiError(404, "Invoice not found");
-  res.json({ data });
+  const [withSignedPhoto] = await signInvoicePhotos([
+    { ...data, invoice_line_items: sortByCreatedAt(data.invoice_line_items) },
+  ]);
+  const [withDeliveryStatus] = await attachDeliveryStatus(storeId, [withSignedPhoto]);
+  res.json({ data: withDeliveryStatus });
 }
 
 export async function deleteInvoice(req: Request, res: Response) {
-  let query = supabase.from("invoices").delete().eq("id", req.params.id).eq("store_id", req.storeId!);
-  const ownerId = creatorScope(req);
-  if (ownerId) query = query.eq("created_by", ownerId);
+  const storeId = req.storeId!;
+  const { data: existing, error: existingError } = await supabase
+    .from("invoices")
+    .select("id, created_by")
+    .eq("id", req.params.id)
+    .eq("store_id", storeId)
+    .maybeSingle();
+  if (existingError) throw new ApiError(500, existingError.message);
+  if (!existing) throw new ApiError(404, "Invoice not found");
+  await assertCanChangeInvoice(req, existing);
 
-  const { data, error } = await query.select("id");
+  const { error } = await supabase.from("invoices").delete().eq("id", existing.id).eq("store_id", storeId);
   if (error) throw new ApiError(500, error.message);
-  if (!data?.length) throw new ApiError(404, "Invoice not found");
   res.status(204).send();
+}
+
+async function replaceInvoiceLines(
+  storeId: string,
+  invoiceId: string,
+  lineItems: z.infer<typeof lineItemSchema>[]
+) {
+  const { data: existing, error } = await supabase
+    .from("invoice_line_items")
+    .select("id")
+    .eq("invoice_id", invoiceId)
+    .eq("store_id", storeId);
+  if (error) throw new ApiError(500, error.message);
+
+  const keep = new Set(lineItems.flatMap((line) => (line.id ? [line.id] : [])));
+  const remove = (existing ?? []).map((row) => row.id as string).filter((id) => !keep.has(id));
+  if (remove.length > 0) {
+    const { error: deleteError } = await supabase.from("invoice_line_items").delete().in("id", remove);
+    if (deleteError) throw new ApiError(500, deleteError.message);
+  }
+
+  const stamp = Date.now();
+  for (const [index, line] of lineItems.entries()) {
+    const row = {
+      raw_name: line.raw_name,
+      quantity: line.quantity,
+      unit_price: line.unit_price,
+      pack_quantity: line.pack_quantity === undefined ? inferPackQuantity(line.raw_name) : line.pack_quantity,
+      total_price: line.quantity * line.unit_price,
+    };
+    if (line.id && keep.has(line.id)) {
+      const { error: updateError } = await supabase
+        .from("invoice_line_items")
+        .update(row)
+        .eq("id", line.id)
+        .eq("invoice_id", invoiceId)
+        .eq("store_id", storeId);
+      if (updateError) throw new ApiError(500, updateError.message);
+    } else {
+      const { error: insertError } = await supabase.from("invoice_line_items").insert({
+        ...row,
+        invoice_id: invoiceId,
+        store_id: storeId,
+        created_at: new Date(stamp + index).toISOString(),
+      });
+      if (insertError) throw new ApiError(500, insertError.message);
+    }
+  }
 }
 
 /**
@@ -219,15 +321,41 @@ export async function confirmInvoice(req: Request, res: Response) {
   if (!invoice) throw new ApiError(404, "Invoice not found");
   if (invoice.status === "confirmed") throw new ApiError(400, "Invoice is already confirmed");
   assertCanEdit(req, invoice.created_by);
+  await writePriceHistory(req, invoice);
 
-  const lineItems: { id: string; raw_name: string; unit_price: number; vendor_item_id: string | null }[] =
-    invoice.invoice_line_items ?? [];
+  const { data: confirmed, error: updateError } = await supabase
+    .from("invoices")
+    .update({ status: "confirmed" })
+    .eq("id", invoice.id)
+    .select("*, vendors(name), invoice_line_items(*)")
+    .single();
+  if (updateError) throw new ApiError(500, updateError.message);
+
+  const [withSignedPhoto] = await signInvoicePhotos([
+    { ...confirmed, invoice_line_items: sortByCreatedAt(confirmed.invoice_line_items) },
+  ]);
+  const [withDeliveryStatus] = await attachDeliveryStatus(storeId, [withSignedPhoto]);
+  res.json({ data: withDeliveryStatus });
+}
+
+async function writePriceHistory(
+  req: Request,
+  invoice: {
+    id: string;
+    vendor_id: string;
+    invoice_date: string;
+    invoice_line_items?: { id: string; raw_name: string; unit_price: number; vendor_item_id: string | null; pack_quantity: number | null }[];
+  }
+) {
+  const storeId = req.storeId!;
+  const lineItems = invoice.invoice_line_items ?? [];
+  if (lineItems.length === 0) return;
 
   // Confirm used to do 4–6 Supabase round-trips *per line*. A 100-item
   // wholesale invoice became hundreds of sequential HTTP calls. Batch
   // instead: load existing catalog rows once, insert what's missing, then
   // link lines and write price history in bulk.
-  if (lineItems.length > 0) {
+  {
     const { data: existingItems, error: itemsError } = await supabase
       .from("items")
       .select("id, canonical_name")
@@ -310,6 +438,7 @@ export async function confirmInvoice(req: Request, res: Response) {
       vendor_id: string;
       invoice_id: string;
       price: number;
+      pack_quantity: number | null;
       recorded_at: string;
     }[] = [];
 
@@ -326,6 +455,7 @@ export async function confirmInvoice(req: Request, res: Response) {
         vendor_id: invoice.vendor_id,
         invoice_id: invoice.id,
         price: line.unit_price,
+        pack_quantity: line.pack_quantity == null ? null : Number(line.pack_quantity),
         recorded_at: invoice.invoice_date,
       });
     }
@@ -341,18 +471,4 @@ export async function confirmInvoice(req: Request, res: Response) {
     const { error: priceError } = await supabase.from("price_history").insert(priceRows);
     if (priceError) throw new ApiError(500, priceError.message);
   }
-
-  const { data: confirmed, error: updateError } = await supabase
-    .from("invoices")
-    .update({ status: "confirmed" })
-    .eq("id", invoice.id)
-    .select("*, vendors(name), invoice_line_items(*)")
-    .single();
-  if (updateError) throw new ApiError(500, updateError.message);
-
-  const [withSignedPhoto] = await signInvoicePhotos([
-    { ...confirmed, invoice_line_items: sortByCreatedAt(confirmed.invoice_line_items) },
-  ]);
-  const [withDeliveryStatus] = await attachDeliveryStatus(storeId, [withSignedPhoto]);
-  res.json({ data: withDeliveryStatus });
 }

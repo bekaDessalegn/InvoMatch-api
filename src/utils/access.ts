@@ -14,6 +14,37 @@ export function creatorScope(req: Request): string | undefined {
   return isManager(req.storeRole) ? undefined : req.userId;
 }
 
+/** A delivery check has been finished, so only the store owner may change the invoice. */
+export async function invoiceDeliveryLocked(storeId: string, invoiceId: string): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("deliveries")
+    .select("status")
+    .eq("store_id", storeId)
+    .eq("invoice_id", invoiceId)
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (error) throw new ApiError(500, error.message);
+  const status = data?.[0]?.status;
+  return status === "verified" || status === "discrepancy";
+}
+
+/**
+ * Owners can change any invoice. Other members can change only their own
+ * invoices, and only before the delivery has been verified.
+ */
+export async function assertCanChangeInvoice(
+  req: Request,
+  invoice: { id: string; created_by: string | null }
+): Promise<void> {
+  if (req.storeRole === "owner") return;
+  if (!invoice.created_by || invoice.created_by !== req.userId) {
+    throw new ApiError(403, "You can only change invoices you created");
+  }
+  if (await invoiceDeliveryLocked(req.storeId!, invoice.id)) {
+    throw new ApiError(403, "Only the store owner can change an invoice after the delivery has been verified");
+  }
+}
+
 export function assertCanEdit(req: Request, createdBy: string | null | undefined): void {
   if (isManager(req.storeRole)) return;
   if (!createdBy || createdBy !== req.userId) {

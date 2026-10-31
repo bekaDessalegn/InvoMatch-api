@@ -87,7 +87,12 @@ export async function parseInvoice(req: Request, res: Response) {
       },
       invoice_number: result.invoiceNumber,
       invoice_date: result.invoiceDate,
-      line_items: result.lineItems.map((li) => ({ raw_name: li.name, quantity: li.quantity, unit_price: li.unit_price })),
+      line_items: result.lineItems.map((li) => ({
+        raw_name: li.name,
+        quantity: li.quantity,
+        unit_price: li.unit_price,
+        pack_quantity: li.units_in_package,
+      })),
       subtotal: result.subtotal,
       tax: result.tax,
       total: result.total,
