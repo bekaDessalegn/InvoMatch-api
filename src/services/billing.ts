@@ -2,9 +2,9 @@ import { supabase } from "../db/supabase";
 import { ApiError } from "../middleware/errorHandler";
 
 export const PLANS = {
-  starter: { name: "Starter", scans: 30, amountCents: 4900 },
-  standard: { name: "Standard", scans: 45, amountCents: 6400 },
-  plus: { name: "Plus", scans: 60, amountCents: 7900 },
+  starter: { name: "Starter", scans: 90, amountCents: 4900 },
+  standard: { name: "Standard", scans: 160, amountCents: 6400 },
+  plus: { name: "Plus", scans: 250, amountCents: 7900 },
 } as const;
 
 export const TOPUPS = {
